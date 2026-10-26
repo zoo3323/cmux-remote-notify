@@ -1,0 +1,862 @@
+#!/bin/bash
+# cmux-remote-notify: when Claude Code or Codex finishes (or waits for you) on a remote machine
+# you reached over SSH or Eternal Terminal + tmux, notify the cmux tab attached to that session
+# and show the agent's status (Running, Needs input, Idle) in the cmux sidebar.
+#
+# Remote: hook.py appends one line to ~/.local/state/cmux-remote-notify/events.jsonl whenever
+#         an agent starts, finishes or waits.
+# Mac:    `watch` follows that file over SSH, finds the tab whose ssh/et connection goes to the
+#         same host and tmux session, notifies it with `cmux notify` and sets the status line of
+#         its workspace with `cmux set-status`. With no such tab it falls back to a macOS banner.
+#
+# Runs on the stock macOS bash 3.2.
+
+set -u
+
+VERSION=0.5.0
+NAME=cmux-remote-notify
+LABEL_PREFIX=io.github.zoo3323.$NAME
+# launchd cannot read files under ~/Desktop or ~/Documents (TCC), so the running copy lives here.
+SHARE_DIR=$HOME/.local/share/$NAME
+STATE_DIR=${CMUX_REMOTE_NOTIFY_STATE:-$HOME/.local/state/$NAME}
+LOG_DIR=$HOME/Library/Logs/$NAME
+AGENT_DIR=${CMUX_REMOTE_NOTIFY_AGENTS:-$HOME/Library/LaunchAgents}
+BIN_LINK=$HOME/.local/bin/$NAME
+STALE_SECONDS=600        # older events (piled up while the Mac slept) mark the tab without a banner
+RECONNECT_SECONDS=15     # wait before reconnecting; doubles on quick failures up to MAX
+MAX_RECONNECT_SECONDS=60
+# The remote writes '#hb' this often. When the Mac sleeps and the link dies, that write blocks and
+# the remote sshd/tail exit within the TCP retransmission limit (about 15 minutes) instead of hours.
+HEARTBEAT_SECONDS=60
+LOG_KEEP_LINES=2000
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+# Remote paths are passed as is so the remote shell expands $HOME.
+REMOTE_SHARE='$HOME/.local/share/cmux-remote-notify'
+REMOTE_STATE='$HOME/.local/state/cmux-remote-notify'
+US=$'\037'               # field separator; unlike a space it keeps empty fields
+# Only these programs count as a connection from a tab (ssh, autossh, et, and the et that
+# ezet manages). A shell command line that merely mentions a host is never mistaken for one.
+CONNECT_CMD_RE=${CMUX_REMOTE_NOTIFY_CONNECT_RE:-'(^|/)(ssh|autossh|et)$|/ezet/et/[^/]+$'}
+
+export PATH="/Applications/cmux.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+CMUX=${CMUX_BIN:-cmux}
+
+# ---------------------------------------------------------------- language
+# English by default, Korean when macOS (or the locale) prefers Korean.
+# CMUX_REMOTE_NOTIFY_LANG=en|ko overrides.
+detect_lang() {
+  local l
+  case ${CMUX_REMOTE_NOTIFY_LANG:-} in en|ko) printf '%s' "$CMUX_REMOTE_NOTIFY_LANG"; return ;; esac
+  l=$(defaults read -g AppleLanguages 2>/dev/null | sed -n '2s/[^A-Za-z-]//gp')
+  [ -n "$l" ] || l=${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}
+  case $l in ko*) printf ko ;; *) printf en ;; esac
+}
+UI_LANG=$(detect_lang)
+# L "English" "한국어"
+L() { if [ "$UI_LANG" = ko ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+die() { printf '%s: %s\n' "$NAME" "$*" >&2; exit 1; }
+
+usage() {
+  if [ "$UI_LANG" = ko ]; then
+    cat <<EOF
+$NAME $VERSION: 원격(SSH·ET + tmux)의 Claude Code·Codex 작업이 끝나면 cmux 탭에 알리고
+Claude 상태(Running·Needs input·Idle)를 그 탭의 사이드바에 띄운다
+
+사용법:
+  $NAME install <장비> [--label 이름]   원격에 훅을 넣고 맥 감시를 켠다
+  $NAME uninstall <장비>                원격 훅과 맥 감시를 뺀다
+  $NAME status                          감시 상태와 최근 기록
+  $NAME doctor [장비]                   전부 점검하고 고치는 법을 알려 준다
+  $NAME test <장비> [세션]              시험 알림 한 번 (세션을 빼면 열린 탭 중 하나)
+  $NAME label <장비> [이름]             사이드바에 보일 장비 이름 (이름을 빼면 지움)
+  $NAME watch <장비>                    감시 실행 (launchd 가 부른다)
+
+<장비> 는 ssh 로 붙는 이름이다 (~/.ssh/config 의 Host, 예: gpu-box).
+EOF
+  else
+    cat <<EOF
+$NAME $VERSION: notify the cmux tab when Claude Code or Codex finishes on a remote
+machine (SSH or ET + tmux), and show Running, Needs input or Idle in its sidebar
+
+usage:
+  $NAME install <host> [--label NAME]   add the remote hooks and start watching from this Mac
+  $NAME uninstall <host>                remove the remote hooks and stop watching
+  $NAME status                          watcher state and recent log
+  $NAME doctor [host]                   check everything and say how to fix what is wrong
+  $NAME test <host> [session]           send one test notification (default: an open tab's session)
+  $NAME label <host> [NAME]             name shown for the host in the sidebar (omit NAME to clear)
+  $NAME watch <host>                    run the watcher (launchd calls this)
+
+<host> is what you pass to ssh (a Host in ~/.ssh/config, for example gpu-box).
+EOF
+  fi
+}
+
+check_host() {
+  case $1 in
+    ''|-*|*[!A-Za-z0-9._@-]*) die "$(L "invalid host name: '$1' (example: gpu-box)" "장비 이름이 올바르지 않아요: '$1' (예: gpu-box)")" ;;
+  esac
+}
+
+label_for() { printf '%s.%s' "$LABEL_PREFIX" "$1"; }
+plist_for() { printf '%s/%s.plist' "$AGENT_DIR" "$(label_for "$1")"; }
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# Follow symlinks to the top directory (the repository or the installed copy) of this script.
+script_root() {
+  local src=$0 dir
+  while [ -h "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case $src in /*) ;; *) src=$dir/$src ;; esac
+  done
+  cd -P "$(dirname "$src")/.." && pwd
+}
+
+# ---------------------------------------------------------------- finding tabs
+# Print "tty<TAB>host<TAB>session" for every ssh/et connection that runs in a terminal.
+# host drops user@ and :port. session is the tmux session named on the command line
+# (new-session -s NAME, attach -t NAME), or empty when it cannot be told.
+#   ssh -t gpu-box tmux new -A -s train
+#   et gpu-box -c "tmux attach -t train"
+#   ezet: et ... gpu-box -c '/usr/bin/tmux' -L 'ezet-x' new-session -A -s 'train'
+#   ssh gpu-box                       (tmux started by hand: session unknown)
+# ps joins the arguments with spaces, so `et -c "tmux a -t x" host` cannot be split back exactly.
+# Known host names (the arguments, plus every installed host) are looked for first; the first
+# argument that is not an option is the fallback.
+connect_tabs() {
+  local known
+  known=" $(printf '%s ' "$@" $(installed_hosts) | sed 's/[^ ]*@//g') "
+  ps -axo tty=,args= | awk -v re="$CONNECT_CMD_RE" -v known="$known" '
+    function unq(s) { gsub(/^["\047]+|["\047;]+$/, "", s); return s }
+    function base(s) { sub(/.*\//, "", s); return s }
+    $1 == "??" || $1 == "-" || $1 == "" { next }
+    $2 !~ re { next }
+    {
+      prog = base($2)
+      # options that take a value, so the value is not taken for the host
+      if (prog == "et" || $2 ~ /\/ezet\/et\//) { sv = "ucptrvkl"; lv = " --username --port --command --terminal-path --tunnel --reversetunnel --jumphost --jport --jserverfifo --verbose --keepalive --logdir --ssh-socket --ssh-config --ssh-option " }
+      else { sv = "BbcDEeFIiJLlmOoPpQRSWw"; lv = " " }
+      hi = 0; skip = 0
+      for (i = 3; i <= NF; i++) {
+        a = $i
+        if (a == "--") { hi = i + 1; break }
+        if (a ~ /^--/) { if (a !~ /=/ && index(lv, " " a " ")) i++; continue }
+        if (a ~ /^-./) {
+          if (prog != "et" && a ~ /^-[WNO]/) skip = 1   # ssh -W/-N/-O: a jump, tunnel or control call
+          if (length(a) == 2 && index(sv, substr(a, 2, 1))) i++
+          continue
+        }
+        hi = i; break
+      }
+      if (skip) next
+      host = ""
+      if (hi && hi <= NF) { x = unq($hi); sub(/^.*@/, "", x); sub(/:[0-9]+$/, "", x); if (index(known, " " x " ")) host = x }
+      for (i = 3; host == "" && i <= NF; i++) {
+        x = unq($i); sub(/^.*@/, "", x); sub(/:[0-9]+$/, "", x)
+        if (x != "" && index(known, " " x " ")) { host = x; break }
+      }
+      if (host == "" && hi && hi <= NF) { host = unq($hi); sub(/^.*@/, "", host); sub(/:[0-9]+$/, "", host) }
+      if (host == "") next
+
+      # find "tmux" anywhere after the program, then its command and session flag
+      n = 0; for (i = 3; i <= NF; i++) w[++n] = $i
+      tm = 0
+      for (j = 1; j <= n; j++) if (base(unq(w[j])) == "tmux") { tm = j; break }
+      s = ""
+      if (tm) {
+        cmd = ""
+        for (j = tm + 1; j <= n; j++) {
+          x = unq(w[j])
+          if (cmd == "") {
+            if (x ~ /^-[LSfcT]$/) { j++; continue }
+            if (x ~ /^-/) continue
+            cmd = x; continue
+          }
+          isnew = (cmd == "new" || (length(cmd) >= 5 && index("new-session", cmd) == 1))
+          isatt = (cmd == "a" || (length(cmd) >= 2 && index("attach-session", cmd) == 1))
+          if (j < n && ((isnew && x == "-s") || (isatt && x == "-t"))) {
+            v = w[j + 1]; k = j + 1
+            # a quoted name with spaces spans several words
+            if (v ~ /^\047/ && v !~ /\047;?$/) {
+              for (k = j + 2; k <= n; k++) { v = v " " w[k]; if (w[k] ~ /\047;?$/) break }
+            }
+            s = unq(v)
+            if (isatt) sub(/:.*$/, "", s)
+            j = k
+            # tmux new -s a \; attach -t b: the last one is the one you see
+            if (w[k] ~ /;$/) cmd = ""
+            continue
+          }
+          if (x == ";" || x == "\\;" || w[j] ~ /;$/) cmd = ""
+        }
+      }
+      printf "%s\t%s\t%s\n", $1, host, s
+    }'
+}
+
+# Lines "tty session" for tabs connected to this host (host without user@).
+open_tabs() {
+  local h=${1##*@}
+  connect_tabs "$h" | awk -F '\t' -v h="$h" '$2 == h { print $1, $3 }'
+}
+
+# Print "workspaceUUID surfaceUUID" for the cmux tabs attached to this host and session.
+# tree is the JSON of `cmux tree`. Matching order:
+#   1. tabs whose ssh/et command names this session
+#   2. the one tab whose title equals the session name
+#   3. the one tab connected to this host whose session could not be told
+find_targets() {
+  local host=$1 session=$2 tree=$3 tabs ttys ids=""
+  [ -n "$session" ] || return 0
+  tabs=$(open_tabs "$host")
+  ttys=$(printf '%s\n' "$tabs" | awk -v s="$session" '$2 == s { print $1 }' | sort -u)
+  [ -z "$ttys" ] || ids=$(tabs_by_tty "$tree" "$ttys")
+  if [ -z "$ids" ]; then
+    ids=$(printf '%s\n' "$tree" | jq -r --arg s "$session" '
+      [.windows[]?.workspaces[]? | (.id // "-") as $w | .panes[]?.surfaces[]?
+       | select(.type == "terminal" and .title == $s) | "\($w) \(.id)"]
+      | if length == 1 then .[0] else empty end' 2>/dev/null)
+  fi
+  if [ -z "$ids" ]; then
+    ttys=$(printf '%s\n' "$tabs" | awk 'NF == 1 { print $1 }' | sort -u)
+    [ -z "$ttys" ] || ids=$(tabs_by_tty "$tree" "$ttys" | awk 'NR == 1 { first = $0 } END { if (NR == 1) print first }')
+  fi
+  [ -z "$ids" ] || printf '%s\n' "$ids"
+}
+
+tabs_by_tty() {
+  printf '%s\n' "$1" | jq -r --arg ttys "$2" '
+    ($ttys | split("\n")) as $t
+    | .windows[]?.workspaces[]? | (.id // "-") as $w | .panes[]?.surfaces[]?
+    | select(.type == "terminal") | select((.tty // "") as $x | $t | any(. == $x)) | "\($w) \(.id)"' 2>/dev/null
+}
+
+find_surfaces() { find_targets "$@" | awk '{ print $2 }'; }
+
+# ---------------------------------------------------------------- sidebar status
+# Files per host:
+#   <host>.agents.json  Claude state per session {"<tmux session>": {"<Claude session ID>": {s, ts, since, task}}}
+#   <host>.applied      status lines set in cmux "workspace key text icon color work priority" (US-separated)
+#   descriptions.json   workspace descriptions this tool wrote {workspace: text}, shared by all hosts
+#   labels.json         names shown for hosts {host: label}
+#
+# In the sidebar each workspace shows:
+#   my project
+#   gpu-box                               <- description: the hosts this workspace's tabs are on
+#   ⚡ train · 12m · summarize the run      <- one line per tmux session: status, time worked, task
+#   ⏸ api · idle                          <- a tab with no Claude, or one that is resting
+# When one tmux session holds several Claudes (claude -p inside, for example) the busiest one shows.
+
+# Update a session's state from one event. kind: running|input|idle|done|error|end
+update_agents() {
+  local host=$1 session=$2 sid=$3 kind=$4 ts=$5 text=$6 f new
+  f=$STATE_DIR/$host.agents.json
+  case $kind in running|input|idle|done|error|end) ;; *) return 0 ;; esac
+  [ -s "$f" ] || echo '{}' > "$f"
+  new=$(jq -c --arg s "$session" --arg id "$sid" --arg k "$kind" --argjson ts "$ts" --arg task "$text" '
+    if $k == "end" then
+      (if .[$s] then .[$s] |= del(.[$id]) else . end) | with_entries(select(.value | length > 0))
+    else
+      (.[$s][$id] // {}) as $p
+      | (if $k == "running" or $k == "input" then $k else "idle" end) as $st
+      | .[$s][$id] = ({s: $st, ts: $ts}
+          # Time worked counts from the prompt, and keeps counting across a permission prompt.
+          + (if $st == "idle" then {}
+             elif ($p.s // "") == "running" or ($p.s // "") == "input" then {since: ($p.since // $ts)}
+             else {since: $ts} end)
+          + (if $k == "running" and $task != "" then {task: $task}
+             elif $p.task then {task: $p.task} else {} end))
+    end' "$f" 2>/dev/null) || { echo '{}' > "$f"; return 0; }
+  printf '%s\n' "$new" > "$f"
+}
+
+# Work out what the sidebar should show. Input: the cmux tree JSON on stdin.
+# Output: "row workspace key text icon color work priority" and "desc set|clear workspace text" (US-separated)
+render_sidebar() {
+  local host=$1 tabs=$2 now=$3 installed=$4
+  jq -r --arg host "${host##*@}" --arg key_host "$host" --argjson tabs "$tabs" --argjson now "$now" \
+    --arg us "$US" --arg lang "$UI_LANG" --argjson installed "$installed" \
+    --slurpfile agents "$STATE_DIR/$host.agents.json" \
+    --slurpfile ours "$STATE_DIR/descriptions.json" \
+    --slurpfile labels "$STATE_DIR/labels.json" '
+    def ko: $lang == "ko";
+    def key($s): ("remote." + $key_host + "." + $s) | gsub("[^A-Za-z0-9._-]"; "_");
+    def dur($sec): ($sec / 60 | floor) as $m
+      | if $m < 1 then (if ko then "방금" else "just now" end)
+        elif $m < 60 then (if ko then "\($m)분" else "\($m)m" end)
+        else ($m / 60 | floor) as $h | ($m % 60) as $r
+          | if ko then "\($h)시간" + (if $r > 0 then " \($r)분" else "" end)
+            else "\($h)h" + (if $r > 0 then " \($r)m" else "" end) end end;
+    def uniq: reduce .[] as $x ([]; if any(.[]; . == $x) then . else . + [$x] end);
+
+    ($agents[0] // {}) as $agents | ($ours[0] // {}) as $ours | ($labels[0] // {}) as $labels
+    | [ .windows[]?.workspaces[]? | select(.id != null) | {ws: .id, desc: (.description // "")} ] as $spaces
+    | [ .windows[]?.workspaces[]? | (.id // "-") as $w | (.description // "") as $d
+        | .panes[]?.surfaces[]? | select(.type == "terminal")
+        | {ws: $w, desc: $d, tty: (.tty // ""), title: (.title // "")} ] as $surf
+    | [ $surf[] as $x | $tabs[] | select(.tty == $x.tty) | {ws: $x.ws, host, session} ] as $tabws
+    # the single tab on this host whose session is unknown (plain `ssh host`, tmux started by hand)
+    | ([ $tabws[] | select(.host == $host and .session == "") | .ws ] | if length == 1 then . else [] end) as $loose
+
+    # one line per session
+    | ( (($agents | keys) + [ $tabws[] | select(.host == $host and .session != "") | .session ] | unique)[] as $s
+        | ([ $tabws[] | select(.host == $host and .session == $s) | .ws ] | unique) as $w1
+        | (if ($w1 | length) > 0 then $w1
+           else ([ $surf[] | select(.title == $s) | .ws ] | if length == 1 then . else $loose end) end) as $wss
+        | ([ ($agents[$s] // {})[] ]) as $sids
+        | ((($sids | map(select(.s == "running")) | first) // ($sids | map(select(.s == "input")) | first)
+            // ($sids | first))) as $a
+        # A tab with no Claude shows as idle too.
+        | select($a != null or ($w1 | length) > 0)
+        | (if $a == null then "idle" else $a.s end) as $st
+        | (if $st == "running" then [dur($now - ($a.since // $a.ts) / 1000), ($a.task // "")] | map(select(. != "")) | join(" · ")
+           elif $st == "input" then [(if ko then "확인 필요" else "needs input" end), ($a.task // "")] | map(select(. != "")) | join(" · ")
+           else (if ko then "대기" else "idle" end) end) as $detail
+        | (if $st == "running" then ["bolt.fill", "#4C8DFF", "running", "50"]
+           elif $st == "input" then ["bell.fill", "#4C8DFF", "", "100"]
+           else ["pause.circle.fill", "#8E8E93", "", "30"] end) as $look
+        | $wss[] | select(. != "-") | (["row", ., key($s), "\($s) · \($detail)"] + $look | join($us)) ),
+
+    # Workspace description: the hosts its tabs are on (installed hosts, or connections running tmux).
+    # A description the user wrote is never touched.
+      ( $spaces[] as $x
+        | [ $tabws[] | select(.ws == $x.ws) | select(.session != "" or (.host as $h | $installed | index($h))) ] as $t
+        | ([ $t[].host ] | uniq | map($labels[.] // .) | join(" · ")) as $want
+        | ($ours[$x.ws] // null) as $mine
+        | if $want != "" and $x.desc != $want and ($x.desc == "" or $x.desc == $mine) then
+            ["desc", "set", $x.ws, $want] | join($us)
+          elif $want == "" and $mine != null and $x.desc == $mine and $x.desc != "" then
+            ["desc", "clear", $x.ws, ""] | join($us)
+          else empty end )
+  '
+}
+
+# Bring the session lines and descriptions in the sidebar up to date.
+# check=1 also verifies that what we set is still in cmux (restores it after cmux restarts).
+sync_status() {
+  local host=$1 check=${2:-0} applied tree tabs now out have new="" line installed
+  local kind ws key label icon color work prio op desc ours rest
+  applied=$STATE_DIR/$host.applied
+  for f in "$STATE_DIR/$host.agents.json" "$STATE_DIR/descriptions.json" "$STATE_DIR/labels.json"; do
+    [ -s "$f" ] || echo '{}' > "$f"
+  done
+  tree=$("$CMUX" tree --all --json --id-format both 2>/dev/null) || return 0
+  now=${CMUX_REMOTE_NOTIFY_NOW:-$(date +%s)}
+  tabs=$(connect_tabs "$host" | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {tty: .[0], host: .[1], session: (.[2] // "")})')
+  installed=$(installed_hosts | sed 's/.*@//' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+  out=$(printf '%s\n' "$tree" | render_sidebar "$host" "$tabs" "$now" "$installed") || return 0
+  have=$(cat "$applied" 2>/dev/null)
+
+  # Set the session lines.
+  while IFS=$US read -r kind ws key label icon color work prio; do
+    [ "$kind" = row ] || continue
+    line="$ws$US$key$US$label$US$icon$US$color$US$work$US$prio"
+    if printf '%s\n' "$have" | grep -qxF "$line"; then
+      if [ "$check" != 1 ] || "$CMUX" list-status --workspace "$ws" 2>/dev/null | grep -qF "$key=$label icon="; then
+        new="$new$line
+"
+        continue
+      fi
+    fi
+    if "$CMUX" set-status "$key" "$label" --icon "$icon" --color "$color" \
+         ${work:+--work "$work"} ${prio:+--priority "$prio"} --workspace "$ws" >/dev/null 2>&1; then
+      new="$new$line
+"
+    fi
+  done <<EOF
+$out
+EOF
+  # Remove lines no longer needed (the session ended, or the tab closed or moved).
+  while IFS=$US read -r ws key rest; do
+    [ -n "$ws" ] || continue
+    printf '%s\n' "$new" | awk -F "$US" -v w="$ws" -v k="$key" '$1 == w && $2 == k { found = 1 } END { exit !found }' \
+      && continue
+    "$CMUX" clear-status "$key" --workspace "$ws" >/dev/null 2>&1
+  done <<EOF
+$have
+EOF
+  printf '%s' "$new" > "$applied"
+
+  # Descriptions
+  ours=$(cat "$STATE_DIR/descriptions.json")
+  while IFS=$US read -r kind op ws desc; do
+    [ "$kind" = desc ] || continue
+    if [ "$op" = set ]; then
+      "$CMUX" workspace-action --action set-description --description "$desc" --workspace "$ws" >/dev/null 2>&1 \
+        && ours=$(printf '%s' "$ours" | jq -c --arg w "$ws" --arg d "$desc" '.[$w] = $d')
+    else
+      "$CMUX" workspace-action --action clear-description --workspace "$ws" >/dev/null 2>&1 \
+        && ours=$(printf '%s' "$ours" | jq -c --arg w "$ws" 'del(.[$w])')
+    fi
+  done <<EOF
+$out
+EOF
+  # Forget workspaces that are gone.
+  printf '%s\n' "$tree" | jq -c --argjson o "$ours" \
+    '[.windows[]?.workspaces[]?.id] as $ids | $o | with_entries(select(.key as $k | $ids | index($k)))' \
+    > "$STATE_DIR/descriptions.json" 2>/dev/null || printf '%s\n' "$ours" > "$STATE_DIR/descriptions.json"
+}
+
+# Remote text is passed as arguments, never spliced into the AppleScript source.
+mac_banner() {
+  osascript - "$@" >/dev/null 2>&1 <<'APPLESCRIPT'
+on run argv
+  display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)
+end run
+APPLESCRIPT
+}
+
+notify_event() {
+  local host=$1 ts=$2 agent=$3 kind=$4 session=$5 cwd=$6 text=$7
+  local who what title body desktop=true tree ids="" id sent=0 why
+  why=$(L "no open tab" "열린 탭 없음")
+  case $agent in claude) who=Claude ;; codex) who=Codex ;; *) who=$agent ;; esac
+  case $kind in
+    done) what=$(L "finished" "완료") ;;
+    input) what=$(L "needs input" "확인 필요") ;;
+    error) what=$(L "stopped on an error" "오류로 멈춤") ;;
+    *) what=$(L "notice" "알림") ;;
+  esac
+  title="$who $what · ${session:-$host}"
+  body=$text
+  [ -n "$body" ] || body=${cwd##*/}
+  [ -n "$body" ] || body=$host
+  [ $(( $(date +%s) - ts / 1000 )) -le "$STALE_SECONDS" ] || desktop=false
+  if tree=$("$CMUX" tree --all --json --id-format both 2>"$STATE_DIR/.cmux-error"); then
+    ids=$(find_surfaces "$host" "$session" "$tree")
+  else
+    why=$(L "cannot reach cmux" "cmux 연결 실패")
+    log "$(L "could not reach cmux" "cmux 에 연결하지 못했어요"): $(head -n 1 "$STATE_DIR/.cmux-error")"
+  fi
+  for id in $ids; do
+    "$CMUX" notify --surface "$id" --title "$title" --body "$body" --desktop "$desktop" >/dev/null 2>&1 && sent=1
+  done
+  if [ "$sent" = 1 ]; then
+    log "$(L "notified tab" "알림 → 탭"): $title"
+  else
+    [ "$desktop" = false ] || mac_banner "$title" "$host" "$body"
+    log "$(L "macOS banner" "알림 → 맥 배너") ($why): $title"
+  fi
+}
+
+# Return 0 and remember the event if it is new, 1 if it was handled already.
+# The first line of <host>.last is the latest time (ms); the following lines are the cksums of the
+# lines handled at that time. Two sessions writing in the same ms both get through, and lines
+# replayed on reconnect are skipped.
+first_seen() {
+  local host=$1 ts=$2 line=$3 f last seen sum
+  f=$STATE_DIR/$host.last
+  { read -r last; seen=$(cat); } 2>/dev/null < "$f"
+  case ${last:-} in ''|*[!0-9]*) last=0 ;; esac
+  sum=$(printf '%s' "$line" | cksum | awk '{ print $1 }')
+  [ "$ts" -ge "$last" ] || return 1
+  if [ "$ts" -eq "$last" ]; then
+    # A file holding only a time (written on first start) means that line was handled.
+    [ -n "${seen:-}" ] || return 1
+    printf '%s\n' "$seen" | grep -qxF "$sum" && return 1
+    printf '%s\n' "$sum" >> "$f"
+  else
+    printf '%s\n%s\n' "$ts" "$sum" > "$f"
+  fi
+  return 0
+}
+
+handle_line() {
+  local host=$1 line=$2 fields ts agent kind session cwd text sid
+  case $line in
+    '{'*) ;;
+    '#'*) sync_status "$host" 1; return 0 ;;   # remote heartbeat (every minute): tidy closed tabs, restore lines
+    *) [ -z "$line" ] || log "$host: $line"; return 0 ;;
+  esac
+  fields=$(printf '%s' "$line" | jq -r '[(.ts // 0 | tostring), .agent, .kind, .session, .cwd, .text, .sid]
+    | map((. // "") | tostring | gsub("[\u001f\r\n]"; " ")) | join("\u001f")' 2>/dev/null) || return 0
+  IFS=$US read -r ts agent kind session cwd text sid <<EOF
+$fields
+EOF
+  case $ts in ''|*[!0-9]*) return 0 ;; esac
+  first_seen "$host" "$ts" "$line" || return 0
+  case $kind in
+    done|input|error|note) notify_event "$host" "$ts" "$agent" "$kind" "$session" "$cwd" "$text" ;;
+  esac
+  [ -n "$session" ] && [ -n "$sid" ] || return 0
+  update_agents "$host" "$session" "$sid" "$kind" "$ts" "$text"
+  sync_status "$host"
+}
+
+# The next wait, from the previous wait and how long the connection lasted.
+next_delay() {
+  local prev=$1 lasted=$2 d
+  if [ "$lasted" -ge 60 ]; then echo "$RECONNECT_SECONDS"; return; fi
+  d=$(( prev * 2 ))
+  [ "$d" -le "$MAX_RECONNECT_SECONDS" ] || d=$MAX_RECONNECT_SECONDS
+  echo "$d"
+}
+
+# launchd holds the log file open, so keep its inode and only cut the front.
+trim_log() {
+  local f=$LOG_DIR/$1.log
+  [ -f "$f" ] && [ "$(wc -l < "$f" | tr -d ' ')" -gt "$LOG_KEEP_LINES" ] || return 0
+  tail -n "$LOG_KEEP_LINES" "$f" > "$f.tmp" && cat "$f.tmp" > "$f"
+  rm -f "$f.tmp"
+}
+
+cmd_watch() {
+  local host=$1 line started delay=$RECONNECT_SECONDS
+  check_host "$host"
+  mkdir -p "$STATE_DIR"
+  trim_log "$host"
+  # On first start, do not replay old events.
+  [ -s "$STATE_DIR/$host.last" ] || printf '%s000\n' "$(date +%s)" > "$STATE_DIR/$host.last"
+  log "$host $(L "watching" "감시 시작") ($NAME $VERSION)"
+  while :; do
+    started=$(date +%s)
+    # When the link ends sshd ends, tail follows it through --pid, and the heartbeat ends on its next write.
+    # Each heartbeat also runs `hook.py sweep` to reap Claude sessions that died without SessionEnd.
+    ssh $SSH_OPTS -n "$host" "f=$REMOTE_STATE/events.jsonl; h=$REMOTE_SHARE/hook.py; mkdir -p \"\${f%/*}\" && touch \"\$f\" || exit 1; sw() { [ ! -x \"\$h\" ] || \"\$h\" sweep >/dev/null 2>&1; }; sw; (while sleep $HEARTBEAT_SECONDS; do sw; echo '#hb' || exit; done) & exec tail -n 200 -F --pid=\$PPID \"\$f\" 2>/dev/null" 2>&1 |
+      while IFS= read -r line; do handle_line "$host" "$line"; done
+    delay=$(next_delay "$delay" $(( $(date +%s) - started )))
+    log "$host $(L "disconnected, retrying in ${delay}s" "연결이 끊겨 ${delay}초 뒤 다시 붙어요")"
+    sleep "$delay"
+  done
+}
+
+install_local() {
+  local root=$1
+  if [ "$root" != "$SHARE_DIR" ]; then
+    mkdir -p "$SHARE_DIR/bin" "$SHARE_DIR/remote"
+    cp "$root/bin/$NAME" "$SHARE_DIR/bin/$NAME"
+    cp "$root/remote/hook.py" "$root/remote/setup.py" "$SHARE_DIR/remote/"
+    chmod 755 "$SHARE_DIR/bin/$NAME"
+  fi
+  mkdir -p "$(dirname "$BIN_LINK")"
+  if [ -e "$BIN_LINK" ] && [ ! -h "$BIN_LINK" ]; then
+    printf '    %s\n' "$(L "another file is at $BIN_LINK, so no link was made" "$BIN_LINK 에 다른 파일이 있어 링크는 만들지 않았어요")"
+  else
+    ln -sf "$SHARE_DIR/bin/$NAME" "$BIN_LINK"
+  fi
+}
+
+write_agent() {
+  local host=$1 label plist i
+  label=$(label_for "$host")
+  plist=$(plist_for "$host")
+  mkdir -p "$AGENT_DIR" "$LOG_DIR" "$STATE_DIR"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$SHARE_DIR/bin/$NAME</string>
+    <string>watch</string>
+    <string>$host</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>StandardOutPath</key><string>$LOG_DIR/$host.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/$host.log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null
+  # Loading right after unloading can fail until the old job is gone, so try a few times.
+  for i in 1 2 3 4 5; do
+    launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null && return 0
+    sleep 1
+  done
+  die "$(L "could not register with launchd" "launchd 에 등록하지 못했어요") ($plist)"
+}
+
+set_label() {
+  local host=$1 name=$2 f=$STATE_DIR/labels.json new
+  mkdir -p "$STATE_DIR"
+  [ -s "$f" ] || echo '{}' > "$f"
+  new=$(jq -c --arg h "${host##*@}" --arg n "$name" 'if $n == "" then del(.[$h]) else .[$h] = $n end' "$f") \
+    && printf '%s\n' "$new" > "$f"
+}
+
+cmd_install() {
+  local host=$1 label=${2-} root out
+  check_host "$host"
+  root=$(script_root)
+  [ -f "$root/remote/hook.py" ] || die "$(L "remote/hook.py not found" "remote/hook.py 를 찾지 못했어요") ($root)"
+  command -v jq >/dev/null || die "$(L "jq is required" "jq 가 필요해요")"
+  command -v "$CMUX" >/dev/null || die "$(L "the cmux command was not found" "cmux 명령을 찾지 못했어요")"
+
+  echo "1/4 $(L "checking $host" "$host 접속 확인")"
+  ssh $SSH_OPTS -n "$host" 'command -v python3 >/dev/null && command -v tail >/dev/null' \
+    || die "$(L "could not reach $host over SSH, or it has no python3" "$host 에 SSH 로 붙지 못했거나 python3 가 없어요")"
+
+  echo "2/4 $(L "installing on this Mac" "맥에 설치") ($SHARE_DIR)"
+  install_local "$root"
+  [ -z "${label+x}" ] || [ -z "$label" ] || set_label "$host" "$label"
+
+  echo "3/4 $(L "installing the hooks on $host" "$host 에 훅 설치")"
+  ssh $SSH_OPTS "$host" "mkdir -p $REMOTE_SHARE && cat > $REMOTE_SHARE/hook.py && chmod 755 $REMOTE_SHARE/hook.py" \
+    < "$root/remote/hook.py" || die "$(L "could not upload the hook" "훅 파일을 올리지 못했어요")"
+  out=$(ssh $SSH_OPTS "$host" python3 - install "$UI_LANG" < "$root/remote/setup.py") || {
+    printf '%s\n' "$out" | sed 's/^/    /'
+    die "$(L "could not change the remote settings" "원격 설정을 바꾸지 못했어요")"
+  }
+  printf '%s\n' "$out" | sed 's/^/    /'
+
+  echo "4/4 $(L "starting the watcher" "맥 감시 켜기") (launchd: $(label_for "$host"))"
+  write_agent "$host"
+
+  echo
+  L "Done. Claude Code picks the hooks up even in sessions that are already open.
+Codex reads its settings at start, so it applies from the next Codex session.
+Try it: $NAME test $host
+" "다 됐어요. Claude Code 는 이미 열려 있는 세션에도 바로 적용돼요.
+Codex 는 설정을 시작할 때 읽어서 새로 여는 세션부터 적용돼요.
+시험: $NAME test $host
+"
+}
+
+cmd_uninstall() {
+  local host=$1 root out
+  check_host "$host"
+  root=$(script_root)
+  echo "1/2 $(L "stopping the watcher" "맥 감시 끄기")"
+  launchctl bootout "gui/$(id -u)/$(label_for "$host")" 2>/dev/null
+  # Take our lines off the sidebar. With no host left, clear the descriptions too.
+  rm -f "$STATE_DIR/$host.agents.json" "$(plist_for "$host")"
+  sync_status "$host"
+  rm -f "$STATE_DIR/$host.last" "$STATE_DIR/$host.applied" "$STATE_DIR/$host.agents.json"
+  set_label "$host" ""
+  [ -n "$(installed_hosts)" ] || clear_descriptions
+
+  echo "2/2 $(L "removing the hooks from $host" "$host 에서 훅 빼기")"
+  out=$(ssh $SSH_OPTS "$host" python3 - uninstall "$UI_LANG" < "$root/remote/setup.py") || {
+    printf '%s\n' "$out" | sed 's/^/    /'
+    die "$(L "could not restore the remote settings" "원격 설정을 되돌리지 못했어요")"
+  }
+  printf '%s\n' "$out" | sed 's/^/    /'
+  ssh $SSH_OPTS -n "$host" "rm -rf $REMOTE_SHARE $REMOTE_STATE" || die "$(L "could not delete the remote files" "원격 파일을 지우지 못했어요")"
+  L "Removed. The Mac copy ($SHARE_DIR) stays for other hosts.
+" "다 뺐어요. 맥 실행본($SHARE_DIR)은 다른 장비용으로 남겨 뒀어요.
+"
+}
+
+# Clear every workspace description this tool wrote (ones the user changed stay).
+clear_descriptions() {
+  local f=$STATE_DIR/descriptions.json tree ws
+  [ -s "$f" ] || return 0
+  tree=$("$CMUX" tree --all --json --id-format both 2>/dev/null) || return 0
+  for ws in $(printf '%s\n' "$tree" | jq -r --slurpfile o "$f" \
+      '.windows[]?.workspaces[]? | select(.description != null and .description == $o[0][.id]) | .id'); do
+    "$CMUX" workspace-action --action clear-description --workspace "$ws" >/dev/null 2>&1
+  done
+  rm -f "$f"
+}
+
+installed_hosts() {
+  local plist label
+  for plist in "$AGENT_DIR/$LABEL_PREFIX".*.plist; do
+    [ -f "$plist" ] || continue
+    label=$(basename "$plist" .plist)
+    echo "${label#"$LABEL_PREFIX".}"
+  done
+}
+
+watcher_pid() {
+  launchctl print "gui/$(id -u)/$(label_for "$1")" 2>/dev/null | awk '$1 == "pid" { print $3; exit }'
+}
+
+cmd_status() {
+  local host pid last found=0
+  for host in $(installed_hosts); do
+    found=1
+    pid=$(watcher_pid "$host")
+    if [ -n "$pid" ]; then echo "$host  $(L "watching" "감시 중") (pid $pid)"; else echo "$host  $(L "stopped" "멈춤")"; fi
+    last=$(head -n 1 "$STATE_DIR/$host.last" 2>/dev/null)
+    case $last in ''|*[!0-9]*) ;; *) echo "    $(L "last event" "마지막 이벤트") $(date -r $(( last / 1000 )) '+%Y-%m-%d %H:%M:%S')" ;; esac
+    tail -n 3 "$LOG_DIR/$host.log" 2>/dev/null | sed 's/^/    /'
+  done
+  [ "$found" = 1 ] || L "No host installed. Start with '$NAME install <host>'.
+" "설치된 장비가 없어요. '$NAME install <장비>' 로 시작해요.
+"
+}
+
+# The checks doctor runs on the remote. Each line is "STATE|message|fix".
+remote_check_script() {
+  printf 'LANG_UI=%s\n' "$UI_LANG"
+  cat <<'EOF'
+t() { if [ "$LANG_UI" = ko ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+d=$HOME/.local/share/cmux-remote-notify
+if [ -x "$d/hook.py" ]; then echo "OK|$(t 'hook file present' '훅 파일 있음')"; else echo "BAD|$(t 'the hook file is missing' '훅 파일이 없어요')|install"; fi
+command -v python3 >/dev/null || { echo "BAD|$(t 'python3 is missing' 'python3 가 없어요')|"; exit 0; }
+LANG_UI=$LANG_UI python3 - <<'PY'
+import json, os
+ko = os.environ.get("LANG_UI") == "ko"
+t = lambda en, k: k if ko else en
+home = os.path.expanduser("~")
+mark = "cmux-remote-notify"
+p = os.path.join(home, ".claude", "settings.json")
+if os.path.isdir(os.path.dirname(p)):
+    try:
+        data = json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+        hooks = data.get("hooks") or {}
+        events = ("Stop", "Notification", "UserPromptSubmit", "PostToolUse",
+                  "StopFailure", "SessionStart", "SessionEnd")
+        have = [e for e in events
+                if any(mark in str(h.get("command", ""))
+                       for g in hooks.get(e, []) if isinstance(g, dict)
+                       for h in g.get("hooks", []) if isinstance(h, dict))]
+        missing = [e for e in events if e not in have]
+        if not missing:
+            print("OK|" + t("Claude Code hooks (%d)", "Claude Code 훅 (알림·상태 %d개)") % len(events))
+        else:
+            print("BAD|" + t("Claude Code hooks are missing (%s). Another tool may have rewritten settings.json",
+                             "Claude Code 훅이 빠졌어요(%s 없음). 다른 도구가 settings.json 을 덮어썼을 수 있어요")
+                  % ", ".join(missing) + "|install")
+    except Exception as e:
+        print("BAD|" + t("could not read the Claude Code settings: %s", "Claude Code 설정을 읽지 못했어요: %s") % e + "|")
+c = os.path.join(home, ".codex", "config.toml")
+if os.path.exists(c):
+    lines = open(c, encoding="utf-8").read().split("\n")
+    if any(l.startswith("notify") and mark in l for l in lines):
+        print("OK|Codex notify")
+    elif any(l.lstrip().startswith("notify") for l in lines):
+        print("INFO|" + t("Codex already has another notify, so Codex will not notify",
+                          "Codex 에 다른 notify 가 있어 Codex 알림은 오지 않아요"))
+    else:
+        print("BAD|" + t("the Codex notify is missing", "Codex notify 가 빠졌어요") + "|install")
+PY
+n=0
+for p in $(pgrep -x tail); do
+  tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q 'cmux-remote-notify/events.jsonl' && n=$((n + 1))
+done
+if [ "$n" -ge 1 ]; then echo "OK|$(t "watcher connections: $n" "맥 감시 연결 ${n}개")"; else echo "BAD|$(t 'no watcher connection. If it just dropped, check again in a minute' '맥 감시 연결이 없어요. 방금 끊겼다면 1분쯤 뒤 다시 봐요')|log"; fi
+f=$HOME/.local/state/cmux-remote-notify/events.jsonl
+if [ -s "$f" ]; then
+  echo "INFO|$(t 'last remote event' '마지막 원격 이벤트'): $(tail -n 1 "$f" | python3 -c 'import json,sys,time; e=json.loads(sys.stdin.read()); print(time.strftime("%m-%d %H:%M:%S", time.localtime(e["ts"]/1000)), e.get("agent"), e.get("kind"), e.get("session"))' 2>/dev/null)"
+fi
+exit 0
+EOF
+}
+
+cmd_doctor() {
+  local hosts host pid mode out kind msg fix tabs st problems=0
+  if [ -n "${1:-}" ]; then check_host "$1"; hosts=$1; else hosts=$(installed_hosts); fi
+  [ -n "$hosts" ] || { L "No host installed. Start with '$NAME install <host>'.
+" "설치된 장비가 없어요. '$NAME install <장비>' 로 시작해요.
+"; return 1; }
+  good()  { printf '  [%s] %s\n' "$(L ok 정상)" "$1"; }
+  note()  { printf '  [%s] %s\n' "$(L info 참고)" "$1"; }
+  fault() { problems=$((problems + 1)); printf '  [%s] %s\n' "$(L FAIL 문제)" "$1"; [ -z "${2:-}" ] || printf '         -> %s\n' "$2"; }
+
+  echo "Mac"
+  mode=$("$CMUX" socket-status --json 2>/dev/null | jq -r '.effective_mode // empty' 2>/dev/null)
+  case $mode in
+    automation) good "$(L "cmux socket control mode: automation" "cmux 소켓 제어 모드: 자동화 모드")" ;;
+    allowAll|openAccess|fullOpenAccess|full) good "$(L "cmux socket control mode" "cmux 소켓 제어 모드"): $mode" ;;
+    *) fault "$(L "cmux socket control mode is '${mode:-unknown}', so the watcher cannot reach cmux" "cmux 소켓 제어 모드가 '${mode:-알 수 없음}' 이라 감시 프로그램이 cmux 에 알림을 보내지 못해요")" \
+         "$(L "cmux Settings > Automation > Socket control mode: Automation (or set automation.socketControlMode to \"automation\" in ~/.config/cmux/cmux.json and run cmux reload-config)" "cmux 설정 > 자동화 > 소켓 제어 모드를 '자동화 모드'로 (cmux.json 의 automation.socketControlMode 를 \"automation\" 으로 두고 cmux reload-config 해도 돼요)")" ;;
+  esac
+
+  for host in $hosts; do
+    echo
+    echo "$host"
+    pid=$(watcher_pid "$host")
+    if [ -n "$pid" ]; then good "$(L "watcher running" "맥 감시 중") (pid $pid)"; else fault "$(L "the watcher is stopped" "맥 감시가 멈춰 있어요")" "$NAME install $host"; fi
+    if out=$(remote_check_script | ssh $SSH_OPTS "$host" 'bash -s' 2>&1); then
+      good "$(L "SSH works" "SSH 접속")"
+      while IFS='|' read -r kind msg fix; do
+        case $fix in
+          install) fix="$NAME install $host" ;;
+          log) fix="$(L "see the log" "기록 보기"): tail -n 30 $LOG_DIR/$host.log" ;;
+        esac
+        case $kind in
+          OK) good "$msg" ;;
+          BAD) fault "$msg" "$fix" ;;
+          INFO) note "$msg" ;;
+        esac
+      done <<EOF
+$out
+EOF
+    else
+      fault "$(L "SSH failed" "SSH 로 붙지 못했어요"): $(printf '%s\n' "$out" | tail -n 1)" \
+        "$(L "check that 'ssh $host' works (VPN, keys). The watcher reconnects by itself once the network is back" "'ssh $host' 가 되는지(VPN, 키) 확인해요. 네트워크가 돌아오면 감시는 스스로 다시 붙어요")"
+    fi
+    st=$(jq -r 'to_entries[] | "\(.key)=" + ([.value[].s] |
+        if index("running") then "Running" elif index("input") then "Needs input" else "Idle" end)' \
+      "$STATE_DIR/$host.agents.json" 2>/dev/null | tr '\n' ' ')
+    note "$(L "remote Claude status" "원격 Claude 상태"): ${st:-$(L none 없음)}"
+    tabs=$(open_tabs "$host" | awk '{ print ($2 == "" ? "?" : $2) }' | sort -u | tr '\n' ' ')
+    if [ -n "$tabs" ]; then note "$(L "tabs connected to this host (session)" "이 장비로 열린 탭(세션)"): $tabs"
+    else note "$(L "no tab is connected to this host, so notifications come as macOS banners only" "이 장비로 열린 탭이 없어요. 알림은 맥 배너로만 와요")"; fi
+    if [ -f "$LOG_DIR/$host.log" ]; then
+      note "$(L "recent log" "최근 기록") ($LOG_DIR/$host.log)"
+      tail -n 3 "$LOG_DIR/$host.log" | sed 's/^/           /'
+    fi
+  done
+  echo
+  if [ "$problems" = 0 ]; then
+    L "No problems found.
+" "문제 없음.
+"
+  else
+    L "$problems thing(s) to check. Follow the -> lines; if that does not help, open an issue with this output.
+" "확인할 것 ${problems}개. -> 줄대로 해 보고, 그래도 안 되면 이 출력과 함께 이슈를 남겨 주세요.
+"
+  fi
+}
+
+# The session of one tab connected to this host.
+pick_session() { open_tabs "$1" | awk 'NF == 2 { print $2; exit }'; }
+
+cmd_test() {
+  local host=$1 session=${2:-} payload
+  check_host "$host"
+  [ -n "$session" ] || session=$(pick_session "$host")
+  [ -n "$session" ] || session=test
+  payload=$(jq -cn --arg msg "$(L "Test notification. If it shows on the '$session' tab, you are connected." "시험 알림이에요. '$session' 탭에 보이면 연결된 거예요.")" \
+    '{hook_event_name: "Stop", cwd: "~", last_assistant_message: $msg}')
+  printf '%s' "$payload" | ssh $SSH_OPTS "$host" \
+    "CMUX_REMOTE_NOTIFY_SESSION=$(shell_quote "$session") $REMOTE_SHARE/hook.py claude" \
+    || die "$(L "could not run the remote hook. Did you run '$NAME install $host'?" "원격 훅을 돌리지 못했어요. 먼저 '$NAME install $host' 를 했는지 확인해 주세요")"
+  L "Sent a test event as session '$session' on $host. It should show within seconds.
+" "$host 의 '$session' 세션 이름으로 시험 이벤트를 보냈어요. 몇 초 안에 알림이 떠야 해요.
+"
+}
+
+cmd_label() {
+  local host=$1
+  check_host "$host"
+  set_label "$host" "${2-}"
+  if [ -n "${2-}" ]; then L "$host shows as '$2' in the sidebar.
+" "$host 는 사이드바에 '$2' 로 보여요.
+"
+  else L "$host shows under its own name.
+" "$host 는 원래 이름으로 보여요.
+"; fi
+}
+
+case ${1:-} in
+  install)
+    case $# in
+      2) cmd_install "$2" ;;
+      4) [ "$3" = --label ] || { usage >&2; exit 2; }; cmd_install "$2" "$4" ;;
+      *) usage >&2; exit 2 ;;
+    esac ;;
+  uninstall) [ $# -eq 2 ] || { usage >&2; exit 2; }; cmd_uninstall "$2" ;;
+  status)    cmd_status ;;
+  doctor)    cmd_doctor "${2:-}" ;;
+  test)      [ $# -ge 2 ] || { usage >&2; exit 2; }; cmd_test "$2" "${3:-}" ;;
+  label)     [ $# -ge 2 ] && [ $# -le 3 ] || { usage >&2; exit 2; }; cmd_label "$2" "${3-}" ;;
+  watch)     [ $# -eq 2 ] || { usage >&2; exit 2; }; cmd_watch "$2" ;;
+  _handle)   mkdir -p "$STATE_DIR"; handle_line "$2" "$3" ;;   # tests: handle one event line
+  _pick)     pick_session "$2" ;;                              # tests: the session `test` would pick
+  _delay)    next_delay "$2" "$3" ;;                           # tests: wait before reconnecting
+  _tabs)     shift; connect_tabs "$@" ;;                       # tests: parsed connections
+  -v|--version) echo "$NAME $VERSION" ;;
+  ''|-h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

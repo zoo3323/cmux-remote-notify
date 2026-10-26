@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 156" width="1000" height="156" role="img" aria-label="Sidebar states: Running, Needs input, Idle">
+<title>Sidebar states: Running, Needs input, Idle</title>
+<style></style>
+<text x="10" y="22" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#F2F2F7" text-anchor="start">Running</text>
+<rect x="8" y="38" width="317.333" height="46" rx="10" fill="#252528" stroke="#3A3A3F"/>
+<path transform="translate(22 53) scale(1)" fill="#5B95FF" d="M9.2 0.8 L2.6 9.1 H7.3 L6.5 15.2 L13.4 6.7 H8.6 Z"/>
+<text x="48" y="66" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="500" fill="#F2F2F7" text-anchor="start">train · 12분 · v2 데이터로 다시 학습</text>
+<text x="10" y="112" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#A1A1A8" text-anchor="start">질문을 받아 일하는 중, 일한 시간과 함께</text>
+<text x="343.333" y="22" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#F2F2F7" text-anchor="start">Needs input</text>
+<rect x="341.333" y="38" width="317.333" height="46" rx="10" fill="#252528" stroke="#3A3A3F"/>
+<path transform="translate(355.333 53) scale(1)" fill="#5B95FF" d="M8 1.2c-2.6 0-4.4 2-4.4 4.6v2.9L2.2 11v0.9h11.6V11l-1.4-2.3V5.8C12.4 3.2 10.6 1.2 8 1.2zM6.1 13a1.9 1.9 0 0 0 3.8 0z"/>
+<text x="381.333" y="66" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="500" fill="#F2F2F7" text-anchor="start">train · 확인 필요</text>
+<text x="343.333" y="112" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#A1A1A8" text-anchor="start">권한이나 답을 기다리는 중</text>
+<text x="676.667" y="22" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#F2F2F7" text-anchor="start">Idle</text>
+<rect x="674.667" y="38" width="317.333" height="46" rx="10" fill="#252528" stroke="#3A3A3F"/>
+<g transform="translate(688.667 53) scale(1)"><circle cx="8" cy="8" r="7" fill="#8E8E93"/><rect x="5.4" y="4.8" width="1.8" height="6.4" rx="0.6" fill="#252528"/><rect x="8.8" y="4.8" width="1.8" height="6.4" rx="0.6" fill="#252528"/></g>
+<text x="714.667" y="66" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="500" fill="#F2F2F7" text-anchor="start">train · 대기</text>
+<text x="676.667" y="112" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#A1A1A8" text-anchor="start">일을 마쳤거나 이 탭에 Claude 가 없음</text>
+</svg>
