@@ -587,7 +587,7 @@ cmd_install() {
   root=$(script_root)
   [ -f "$root/remote/hook.py" ] || die "$(L "remote/hook.py not found" "remote/hook.py 를 찾지 못했어요") ($root)"
   command -v jq >/dev/null || die "$(L "jq is required" "jq 가 필요해요")"
-  command -v "$CMUX" >/dev/null || die "$(L "the cmux command was not found" "cmux 명령을 찾지 못했어요")"
+  command -v "$CMUX" >/dev/null || die "$(L "the cmux command was not found. This tool works only with the cmux terminal: https://cmux.com" "cmux 명령을 찾지 못했어요. 이 도구는 cmux 터미널 전용이에요: https://cmux.com")"
 
   echo "1/4 $(L "checking $host" "$host 접속 확인")"
   ssh $SSH_OPTS -n "$host" 'command -v python3 >/dev/null && command -v tail >/dev/null' \
