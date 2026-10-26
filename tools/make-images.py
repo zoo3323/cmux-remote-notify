@@ -28,7 +28,8 @@ THEMES = {
 
 TEXT = {
     "en": dict(
-        idle="idle", needs="needs input", m12="12m", m13="13m", task="retrain on v2 data",
+        idle="idle", needs="needs input", m12="12m", m13="13m", m3="3m", task="retrain on v2 data",
+        task2="compare checkpoints", t_input2="Claude needs input · eval",
         t_input="Claude needs input · train", b_input="Claude needs your permission to use Bash",
         t_done="Claude finished · train", b_done="Validation loss went from 0.41 to 0.32.",
         perm_title="Bash command", perm_q="Do you want to proceed?", yes="1. Yes", no="2. No",
@@ -47,7 +48,8 @@ TEXT = {
         f_link="ssh  ·  tail -F",
     ),
     "ko": dict(
-        idle="대기", needs="확인 필요", m12="12분", m13="13분", task="v2 데이터로 다시 학습",
+        idle="대기", needs="확인 필요", m12="12분", m13="13분", m3="3분", task="v2 데이터로 다시 학습",
+        task2="체크포인트 비교", t_input2="Claude 확인 필요 · eval",
         t_input="Claude 확인 필요 · train", b_input="Claude needs your permission to use Bash",
         t_done="Claude 완료 · train", b_done="검증 손실이 0.41 에서 0.32 로 줄었어요.",
         perm_title="Bash command", perm_q="Do you want to proceed?", yes="1. Yes", no="2. No",
@@ -137,6 +139,7 @@ def show(name, a, b, slide=False, fade=0.8):
 
 
 def hero(theme, lang):
+    """You work in a local workspace; the remote one further down the sidebar reports on its own."""
     c, t = THEMES[theme], TEXT[lang]
     W, H = 1000, 480
     wx, wy, ww, wh = 24, 14, 952, 440
@@ -155,60 +158,65 @@ def hero(theme, lang):
                 % (c["shadow"], c["shadow"], wx, wy, ww, wh))
     body.append('<rect x="%d" y="%d" width="%d" height="%d" rx="12" fill="%s" filter="url(#sh)"/>' % (wx, wy, ww, wh, c["window"]))
     body.append('<g clip-path="url(#win)">')
-    # title bar + sidebar
     body.append('<rect x="%d" y="%d" width="%d" height="%d" fill="%s"/>' % (sx, wy, sw, wh, c["side"]))
     body.append('<rect x="%d" y="%d" width="%d" height="38" fill="%s"/>' % (mx, wy, ww - sw, c["bar"]))
     for i, col in enumerate(("#FF5F57", "#FEBC2E", "#28C840")):
         body.append('<circle cx="%d" cy="%d" r="6" fill="%s"/>' % (wx + 20 + i * 20, wy + 19, col))
     body.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s"/>' % (mx + 0.5, wy, mx + 0.5, wy + wh, c["line"]))
-    body.append(text(mx + 18, wy + 24, "ml-research", 12.5, c["text2"], 600))
+    body.append(text(mx + 18, wy + 24, "web-app", 12.5, c["text2"], 600))
 
-    # sidebar: workspace 1 (selected)
-    bx, by, bw = sx + 10, ty + 10, sw - 20
-    body.append('<rect x="%d" y="%d" width="%d" height="104" rx="9" fill="%s"/>' % (bx, by, bw, c["sel"]))
-    body.append(text(bx + 14, by + 22, "ml-research", 13.5, c["seltext"], 650))
-    body.append(text(bx + 14, by + 40, "gpu-box", 11.5, c["seltext2"], 500))
-    r1 = by + 60   # first status row baseline
-    r2 = by + 82
-    white = c["seltext"]
-    # train row: four states
-    rows = [
-        ("rRun1", bolt(bx + 12, r1 - 11, white, 0.8), "train · %s · %s" % (t["m12"], t["task"]), 0, 30),
-        ("rIn", bell(bx + 12, r1 - 11, white, 0.8), "train · %s · %s" % (t["needs"], t["task"]), 30, 48),
-        ("rRun2", bolt(bx + 12, r1 - 11, white, 0.8), "train · %s · %s" % (t["m13"], t["task"]), 48, 70),
-        ("rIdle", pause(bx + 12, r1 - 11, "rgba(255,255,255,.85)", c["sel"], 0.8), "train · %s" % t["idle"], 70, 100),
-    ]
-    for name, icon, label, a, b in rows:
+    bx, bw = sx + 10, sw - 20
+    # workspace 1: the one you are working in (local)
+    by = ty + 10
+    body.append('<rect x="%d" y="%d" width="%d" height="62" rx="9" fill="%s"/>' % (bx, by, bw, c["sel"]))
+    body.append(text(bx + 14, by + 24, "web-app", 13.5, c["seltext"], 650))
+    body.append(text(bx + 14, by + 43, "~/code/web-app", 11.5, c["seltext2"], 500))
+
+    # workspace 2: the remote one. It is not selected; it speaks up by itself.
+    ry = by + 76
+    rh = 98
+    for name, a, b in (("hl1", 30, 100),):
         style.append(show(name, a, b, fade=0.6))
-        body.append('<g class="%s">%s%s</g>' % (name, icon, text(bx + 32, r1, fit(label, bw - 44, 11.5), 11.5, white, 500)))
-    body.append(pause(bx + 12, r2 - 11, "rgba(255,255,255,.85)", c["sel"], 0.8))
-    body.append(text(bx + 32, r2, "eval · %s" % t["idle"], 11.5, white, 500))
+    body.append('<rect class="hl1" x="%d" y="%d" width="%d" height="%d" rx="9" fill="%s" stroke="%s" stroke-width="1.6"/>'
+                % (bx + 0.8, ry + 0.8, bw - 1.6, rh - 1.6, c["box"], c["blue"]))
+    body.append(text(bx + 14, ry + 24, "ml-research", 13.5, c["text"], 650))
+    body.append(text(bx + 14, ry + 43, "gpu-box", 11.5, c["text2"], 500))
+    # unread badge next to the title
+    for name, a, b, n in (("bd1", 30, 60, "1"), ("bd2", 60, 100, "2")):
+        style.append(show(name, a, b, fade=0.5))
+        body.append('<g class="%s"><rect x="%d" y="%d" width="22" height="18" rx="9" fill="%s"/>%s</g>'
+                    % (name, bx + bw - 34, ry + 11, c["blue"], text(bx + bw - 23, ry + 24, n, 11.5, "#FFFFFF", 700, anchor="middle")))
+    r1, r2 = ry + 64, ry + 84
+    tw = bw - 44
+    rows = [
+        ("tRun", bolt(bx + 12, r1 - 11, c["blue"], 0.8), "train · %s · %s" % (t["m12"], t["task"]), 0, 30, c["text"]),
+        ("tIdle", pause(bx + 12, r1 - 11, c["grey"], c["side"], 0.8), "train · %s" % t["idle"], 30, 100, c["text2"]),
+        ("eRun", bolt(bx + 12, r2 - 11, c["blue"], 0.8), "eval · %s · %s" % (t["m3"], t["task2"]), 0, 60, c["text"]),
+        ("eIn", bell(bx + 12, r2 - 11, c["blue"], 0.8), "eval · %s · %s" % (t["needs"], t["task2"]), 60, 100, c["text"]),
+    ]
+    for name, icon, label, a, b, col in rows:
+        style.append(show(name, a, b, fade=0.6))
+        y = r1 if name[0] == "t" else r2
+        body.append('<g class="%s">%s%s</g>' % (name, icon, text(bx + 32, y, fit(label, tw, 11.5), 11.5, col, 500)))
 
-    # workspace 2 and 3
-    y2 = by + 122
-    body.append(text(bx + 14, y2 + 18, "web-app", 13.5, c["text"], 650))
-    body.append(text(bx + 14, y2 + 36, "staging", 11.5, c["text2"], 500))
-    body.append(pause(bx + 12, y2 + 56 - 11, c["grey"], c["side"], 0.8))
-    body.append(text(bx + 32, y2 + 56, "api · %s" % t["idle"], 11.5, c["text2"], 500))
-    y3 = y2 + 84
+    # workspace 3
+    y3 = ry + rh + 14
     body.append(text(bx + 14, y3 + 18, "notes", 13.5, c["text"], 650))
     body.append(text(bx + 14, y3 + 36, "~/notes", 11.5, c["text2"], 500))
 
-    # tab bar
+    # tab bar: local tabs
     body.append('<rect x="%d" y="%d" width="%d" height="%d" fill="%s"/>' % (mx, ty, ww - sw, tab_h, c["side"]))
     body.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s"/>' % (mx, ty + 0.5, wx + ww, ty + 0.5, c["line"]))
     body.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s"/>' % (mx, ty + tab_h - 0.5, wx + ww, ty + tab_h - 0.5, c["line"]))
     body.append('<rect x="%d" y="%d" width="120" height="%d" fill="%s"/>' % (mx, ty + 1, tab_h - 1, c["term"]))
-    body.append(text(mx + 18, ty + 22, "train", 12.5, c["text"], 600))
-    body.append(text(mx + 138, ty + 22, "eval", 12.5, c["text2"], 500))
+    body.append(text(mx + 18, ty + 22, "zsh", 12.5, c["text"], 600))
+    body.append(text(mx + 138, ty + 22, "dev server", 12.5, c["text2"], 500))
     body.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s"/>' % (mx + 120.5, ty, mx + 120.5, ty + tab_h, c["line"]))
 
-    # terminal
+    # terminal: your own local work
     tx, top = mx + 22, ty + tab_h
     body.append('<rect x="%d" y="%d" width="%d" height="%d" fill="%s"/>' % (mx, top, ww - sw, wh - (top - wy), c["term"]))
-    lh = 21
-    y = top + 30
-    fs = 12.5
+    lh, fs, cw = 21, 12.5, 7.53
 
     def mono(x, yy, s, color, weight=400):
         return text(x, yy, s, fs, color, weight, MONO, extra=' xml:space="preserve"')
@@ -220,54 +228,33 @@ def hero(theme, lang):
             return '<g class="%s">%s</g>' % (name, g)
         return g
 
-    cw = 7.53  # monospace advance at 12.5px
-    body.append(line(None, 0, [(tx, "me@gpu-box:~/ml$ ", c["dim"], 400), (tx + cw * 17, "claude", c["text"], 400)], y))
-    y += lh * 1.5
-    body.append(line(None, 0, [(tx, "> ", c["dim"], 400), (tx + cw * 2, t["task"], c["text"], 600)], y))
-    y += lh * 1.5
-    body.append(line(None, 0, [(tx, "●", c["green"], 400), (tx + cw * 2, "Read", c["text"], 600),
-                               (tx + cw * 6, "(data/v2/manifest.json)", c["text2"], 400)], y))
-    y += lh * 1.4
-    body.append(line("l1", 6, [(tx, "●", c["green"], 400), (tx + cw * 2, "Bash", c["text"], 600),
-                               (tx + cw * 6, "(python train.py --data v2)", c["text2"], 400)], y))
+    p = "~/code/web-app $ "
+    y = top + 30
+    body.append(line(None, 0, [(tx, p, c["dim"], 400), (tx + cw * len(p), "npm test", c["text"], 400)], y))
     y += lh
-    body.append(line("l2", 14, [(tx + cw * 2, "⎿  epoch 10/10  loss 0.31  done", c["dim"], 400)], y))
-    y += lh * 1.4
-    # permission prompt (30% - 48%)
-    py = y - 15
-    style.append(show("perm", 30, 48, fade=0.5))
-    perm = ['<rect x="%d" y="%d" width="%d" height="%d" rx="8" fill="none" stroke="%s" stroke-width="1.4"/>'
-            % (tx - 8, py, 470, lh * 5 + 22, c["orange"]),
-            mono(tx + 6, py + 22, t["perm_title"], c["orange"], 600),
-            mono(tx + 6, py + 22 + lh, "python eval.py --ckpt best", c["text"]),
-            mono(tx + 6, py + 22 + lh * 2.3, t["perm_q"], c["text2"]),
-            mono(tx + 6, py + 22 + lh * 3.3, "❯ " + t["yes"], c["blue"], 600),
-            mono(tx + 6, py + 22 + lh * 4.3, "  " + t["no"], c["text2"])]
-    body.append('<g class="perm">%s</g>' % "".join(perm))
-    # after the permission
-    body.append(line("l3", 49, [(tx, "●", c["green"], 400), (tx + cw * 2, "Bash", c["text"], 600),
-                                (tx + cw * 6, "(python eval.py --ckpt best)", c["text2"], 400)], y))
-    body.append(line("l4", 58, [(tx + cw * 2, "⎿  val loss 0.32  (was 0.41)", c["dim"], 400)], y + lh))
-    body.append(line("l5", 70, [(tx, "●", c["text"], 400), (tx + cw * 2, t["final"], c["text"], 400)], y + lh * 2.6))
-    # input box at the bottom
-    iy = wy + wh - 46
-    body.append('<rect x="%d" y="%d" width="%d" height="30" rx="7" fill="none" stroke="%s"/>' % (tx - 8, iy, ww - sw - 30, c["line"]))
-    body.append(mono(tx + 4, iy + 20, ">", c["dim"]))
+    body.append(line("l1", 4, [(tx, " PASS ", c["green"], 600), (tx + cw * 7, "src/cart.test.ts", c["text2"], 400)], y))
+    y += lh
+    body.append(line("l2", 8, [(tx, " PASS ", c["green"], 600), (tx + cw * 7, "src/checkout.test.ts", c["text2"], 400)], y))
+    y += lh
+    body.append(line("l3", 13, [(tx, "Tests: ", c["text"], 600), (tx + cw * 7, "128 passed, 128 total", c["green"], 400)], y))
+    y += lh * 1.5
+    body.append(line("l4", 22, [(tx, p, c["dim"], 400), (tx + cw * len(p), 'git commit -am "fix cart totals"', c["text"], 400)], y))
+    y += lh
+    body.append(line("l5", 34, [(tx, "[main 3f2a91c] fix cart totals", c["text2"], 400)], y))
+    y += lh
+    body.append(line("l6", 36, [(tx, " 2 files changed, 14 insertions(+), 3 deletions(-)", c["text2"], 400)], y))
+    y += lh * 1.5
+    body.append(line("l7", 44, [(tx, p, c["dim"], 400), (tx + cw * len(p), "npm run dev", c["text"], 400)], y))
+    y += lh
+    body.append(line("l8", 52, [(tx, "  ready in 412 ms", c["text2"], 400)], y))
+    y += lh
+    body.append(line("l9", 53, [(tx, "  Local:  ", c["text2"], 400), (tx + cw * 10, "http://localhost:5173/", c["blue"], 400)], y))
     style.append("@keyframes caret{0%,49%{opacity:1}50%,100%{opacity:0}}.caret{animation:caret 1.1s steps(1) infinite}\n")
-    body.append('<rect class="caret" x="%g" y="%d" width="7.5" height="15" fill="%s"/>' % (tx + 4 + cw * 2, iy + 8, c["text2"]))
-    # working spinner text while running
-    for name, a, b in (("w1", 0, 30), ("w2", 48, 70)):
-        style.append(show(name, a, b, fade=0.5))
-        body.append('<g class="%s">%s</g>' % (name, mono(tx, iy - 14, "✻ Working…", c["orange"])))
-
-    # pane ring (cmux marks the pane that has a new notification)
-    for name, a, b in (("ring1", 30, 48), ("ring2", 70, 94)):
-        style.append(show(name, a, b, fade=0.5))
-        body.append('<rect class="%s" x="%d" y="%d" width="%d" height="%d" rx="3" fill="none" stroke="%s" stroke-width="2.5"/>'
-                    % (name, mx + 2, top + 2, ww - sw - 4, wh - (top - wy) - 4, c["blue"]))
+    style.append(show("cw", 54, 100, fade=0.3))
+    body.append('<g class="cw"><rect class="caret" x="%g" y="%d" width="7.5" height="15" fill="%s"/></g>' % (tx, y + lh - 12, c["text2"]))
     body.append('</g>')
 
-    # macOS banner
+    # macOS banners from cmux
     def toast(name, a, b, title, sub, msg):
         style.append(show(name, a, b, slide=True, fade=0.7))
         x0, y0, w0, h0 = wx + ww - 352, wy + 52, 334, 76
@@ -280,12 +267,14 @@ def hero(theme, lang):
                    text(x0 + 64, y0 + 25, title, 13, c["text"], 650),
                    text(x0 + 64, y0 + 43, sub, 12, c["text2"], 500),
                    text(x0 + 64, y0 + 61, msg, 12, c["text"], 400)))
-    body.append(toast("tIn", 30.5, 46, t["t_input"], "gpu-box", t["b_input"]))
-    body.append(toast("tDone", 70.5, 92, t["t_done"], "gpu-box", t["b_done"]))
+    body.append(toast("tsDone", 30.5, 54, t["t_done"], "gpu-box", t["b_done"]))
+    body.append(toast("tsIn", 60.5, 90, t["t_input2"], "gpu-box", t["b_input"]))
 
-    style.append("@media (prefers-reduced-motion: reduce){*{animation:none!important}.rIdle,.l1,.l2,.l3,.l4,.l5,.tDone,.ring2{opacity:1!important;transform:none!important}}\n")
-    title = "cmux window: a remote Claude Code session moves from Running to Needs input to Idle" if lang == "en" else \
-        "cmux 창: 원격 Claude Code 세션이 Running, Needs input, Idle 로 바뀌는 모습"
+    style.append("@media (prefers-reduced-motion: reduce){*{animation:none!important}"
+                 ".hl1,.bd2,.tIdle,.eIn,.l1,.l2,.l3,.l4,.l5,.l6,.l7,.l8,.l9,.tsIn{opacity:1!important;transform:none!important}}\n")
+    title = ("cmux: while you work in a local workspace, the remote ml-research workspace reports that train finished "
+             "and eval needs input") if lang == "en" else \
+        "cmux: 로컬 작업 공간에서 일하는 동안, 원격 ml-research 작업 공간이 train 완료와 eval 확인 필요를 알린다"
     return svg(W, H, "\n".join(body), "".join(style), title)
 
 

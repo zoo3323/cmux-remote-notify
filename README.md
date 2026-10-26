@@ -11,10 +11,10 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/hero-dark.svg">
-  <img src="docs/img/hero-light.svg" alt="A cmux window: a remote Claude Code session goes from Running to Needs input to Idle, and cmux shows a notification each time" width="100%">
+  <img src="docs/img/hero-light.svg" alt="You work in a local cmux workspace. Further down the sidebar, the remote ml-research workspace gets an unread badge and a banner when train finishes and when eval needs input." width="100%">
 </picture>
 
-Agents running on a server inside tmux, reached with SSH or [Eternal Terminal](https://eternalterminal.dev/), stay invisible to [cmux](https://cmux.com). This tool brings them back: the tab attached to that tmux session gets the notification ring and a macOS banner, and the workspace in the sidebar shows what each session is doing.
+Keep working in another tab. When an agent on a remote server (tmux over SSH or [Eternal Terminal](https://eternalterminal.dev/)) finishes or needs you, [cmux](https://cmux.com) tells you: a banner, an unread badge on that workspace, the ring on its tab, and a sidebar line saying what each session is doing. Without this, remote agents are invisible to cmux.
 
 ## Install
 

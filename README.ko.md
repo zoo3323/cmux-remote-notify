@@ -11,10 +11,10 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/hero-dark.ko.svg">
-  <img src="docs/img/hero-light.ko.svg" alt="cmux 창: 원격 Claude Code 세션이 Running, Needs input, Idle 로 바뀌고 그때마다 cmux 알림이 뜬다" width="100%">
+  <img src="docs/img/hero-light.ko.svg" alt="로컬 작업 공간에서 일하는 동안, 사이드바 아래 원격 ml-research 작업 공간에 train 완료와 eval 확인 필요 때마다 읽지 않은 배지와 배너가 뜬다" width="100%">
 </picture>
 
-SSH 나 [Eternal Terminal](https://eternalterminal.dev/) 로 붙은 서버의 tmux 안에서 도는 에이전트는 [cmux](https://cmux.com) 가 알아채지 못합니다. 이 도구를 쓰면 그 tmux 세션이 열린 탭에 알림 테두리와 맥 배너가 뜨고, 사이드바의 작업 공간에 세션마다 지금 하는 일이 보입니다.
+다른 탭에서 하던 일을 계속하세요. 원격 서버(SSH 나 [Eternal Terminal](https://eternalterminal.dev/) 로 붙은 tmux)의 에이전트가 일을 끝내거나 확인을 기다리면 [cmux](https://cmux.com) 가 알려 줍니다. 맥 배너가 뜨고, 그 작업 공간에 읽지 않은 배지와 탭 테두리가 붙고, 사이드바에 세션마다 지금 하는 일이 보입니다. 이 도구가 없으면 cmux 는 원격 에이전트를 알아채지 못합니다.
 
 ## 설치
 
