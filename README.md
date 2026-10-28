@@ -14,7 +14,7 @@
   <img src="docs/img/hero-light.svg" alt="You work in a local cmux workspace. Further down the sidebar, the remote ml-research workspace gets an unread badge and a banner when train finishes and when eval needs input." width="100%">
 </picture>
 
-Keep working in another tab. When an agent on a remote server (over SSH, [Eternal Terminal](https://eternalterminal.dev/) or [mosh](https://mosh.org), in tmux or not) finishes or needs you, [cmux](https://cmux.com) tells you: a banner, an unread badge on that workspace, the ring on its tab, and a sidebar line saying what each session is doing. Without this, remote agents are invisible to cmux.
+Keep working in another tab. When an agent on a remote server (over SSH, [Eternal Terminal](https://eternalterminal.dev/) or [mosh](https://mosh.org), in tmux or not) finishes or needs you, [cmux](https://cmux.com) tells you: a banner, an unread badge on that workspace, the ring on its tab, and a sidebar line saying what each session is doing. On its own, cmux hears a remote agent only through terminal escape codes: mosh drops them, tmux drops them unless passthrough is on, Claude Code sends them only after about a minute, and a closed tab gets nothing. This tool reports every turn the moment it ends, the same way over any connection.
 
 ## Install
 
@@ -25,13 +25,13 @@ bin/cmux-remote-notify install gpu-box     # the name you give ssh
 cmux-remote-notify test gpu-box            # a test notification on that tab
 ```
 
-Run `install` once per host. It adds hooks on the host and a watcher on your Mac that starts at login and reconnects after sleep.
+Run `install` once per host. It adds hooks on the host and a watcher on your Mac that starts at login and reconnects after sleep. For Codex, open Codex on the host once, type `/hooks` and trust the cmux-remote-notify hooks; until then Codex sends finished turns only, with no sidebar status.
 
 | Where | Needs |
 |---|---|
 | Mac | cmux, `jq` (built into macOS 15, or `brew install jq`), an SSH key that logs in to the host without a password |
 | cmux | Settings › Automation › Socket control mode: **Automation** |
-| Host | Linux with `python3` and Claude Code, in tmux or not. Codex works too (notifications only) |
+| Host | Linux with `python3` and Claude Code or Codex, in tmux or not |
 
 ## The sidebar
 
@@ -87,6 +87,7 @@ Start with `cmux-remote-notify doctor`. It checks the watcher, the cmux socket m
 | Banner only, no tab ring | no open tab shows that agent (a detached tmux session) | attach to it from a tab |
 | Stopped after a cmux update | socket control mode went back to "cmux processes only" | set it to Automation |
 | Running stays after Esc | Esc sends no `Stop` | it turns Idle about a minute later |
+| A turn notifies twice | Claude Code's or Codex's own notifications were turned on again | `install <host>` again (`doctor` shows which) |
 
 Logs: `~/Library/Logs/cmux-remote-notify/<host>.log` on the Mac, `~/.local/state/cmux-remote-notify/events.jsonl` on the host.
 
@@ -98,7 +99,8 @@ Logs: `~/Library/Logs/cmux-remote-notify/<host>.log` on the Mac, `~/.local/state
 | Where | What |
 |---|---|
 | Host | `~/.local/share/cmux-remote-notify/hook.py`, events in `~/.local/state/cmux-remote-notify/` |
-| Host | one entry in each of 7 hook events in `~/.claude/settings.json`, and `notify` in `~/.codex/config.toml` unless you already have one. Both files are backed up first, and `uninstall` removes only these entries |
+| Host | one entry in each of 7 hook events in `~/.claude/settings.json` and in `~/.codex/hooks.json`, and `notify` in `~/.codex/config.toml` unless you already have one. These files are backed up first, and `uninstall` removes only these entries |
+| Host | the agents' own terminal notifications are turned off so a turn never notifies twice: `preferredNotifChannel` in `~/.claude/settings.json` and `[tui] notifications` in `~/.codex/config.toml`. `uninstall` puts back what was there |
 | Mac | a copy in `~/.local/share/cmux-remote-notify/` (launchd cannot read `~/Desktop`), the link `~/.local/bin/cmux-remote-notify`, and `~/Library/LaunchAgents/io.github.zoo3323.cmux-remote-notify.<host>.plist` |
 
 </details>
@@ -108,7 +110,7 @@ Logs: `~/Library/Logs/cmux-remote-notify/<host>.log` on the Mac, `~/.local/state
 
 Messages and sidebar text follow your macOS language, English or Korean. `CMUX_REMOTE_NOTIFY_LANG=en` forces English.
 
-Claude Code background sessions (`/bg`) run under a daemon; their status goes to the tab of the Claude client that is watching them.
+Claude Code background sessions (`/bg`) run under a daemon; their status goes to the tab of the Claude client that is watching them. Codex sessions run in Codex's shared app-server the same way, and go to the tab of the Codex window showing them.
 
 Not matched: two tabs to one host whose logins started within two seconds of each other and have the same terminal size, when neither the port nor a tmux session name tells them apart.
 

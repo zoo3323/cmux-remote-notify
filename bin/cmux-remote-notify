@@ -13,7 +13,7 @@
 
 set -u
 
-VERSION=0.6.0
+VERSION=0.7.0
 NAME=cmux-remote-notify
 LABEL_PREFIX=io.github.zoo3323.$NAME
 # launchd cannot read files under ~/Desktop or ~/Documents (TCC), so the running copy lives here.
@@ -753,10 +753,12 @@ cmd_uninstall() {
   root=$(script_root)
   echo "1/2 $(L "stopping the watcher" "맥 감시 끄기")"
   launchctl bootout "gui/$(id -u)/$(label_for "$host")" 2>/dev/null
-  # Take our lines off the sidebar. With no host left, clear the descriptions too.
-  rm -f "$STATE_DIR/$host.agents.json" "$(plist_for "$host")"
-  sync_status "$host"
-  rm -f "$STATE_DIR/$host.last" "$STATE_DIR/$host.applied" "$STATE_DIR/$host.agents.json"
+  # Take our lines off the sidebar: every line we set for this host, in every workspace (a sync
+  # would put back the idle lines of tabs that are still open). With no host left, clear the
+  # descriptions too.
+  rm -f "$(plist_for "$host")"
+  clear_lines "$host"
+  rm -f "$STATE_DIR/$host.last" "$STATE_DIR/$host.applied" "$STATE_DIR/$host.agents.json" "$STATE_DIR/$host.where.json"
   set_label "$host" ""
   [ -n "$(installed_hosts)" ] || clear_descriptions
 
@@ -770,6 +772,17 @@ cmd_uninstall() {
   L "Removed. The Mac copy ($SHARE_DIR) stays for other hosts.
 " "다 뺐어요. 맥 실행본($SHARE_DIR)은 다른 장비용으로 남겨 뒀어요.
 "
+}
+
+# Clear every sidebar line this tool set for a host, in every workspace.
+clear_lines() {
+  local host=$1 prefix ws key
+  prefix="remote.$(printf '%s' "$host" | sed 's/[^A-Za-z0-9._-]/_/g')."
+  for ws in $("$CMUX" tree --all --json --id-format both 2>/dev/null | jq -r '.windows[]?.workspaces[]?.id // empty'); do
+    for key in $("$CMUX" list-status --workspace "$ws" 2>/dev/null | awk -F= -v p="$prefix" 'index($1, p) == 1 { print $1 }'); do
+      "$CMUX" clear-status "$key" --workspace "$ws" >/dev/null 2>&1
+    done
+  done
 }
 
 # Clear every workspace description this tool wrote (ones the user changed stay).
@@ -846,6 +859,56 @@ if os.path.isdir(os.path.dirname(p)):
                   % ", ".join(missing) + "|install")
     except Exception as e:
         print("BAD|" + t("could not read the Claude Code settings: %s", "Claude Code 설정을 읽지 못했어요: %s") % e + "|")
+hj = os.path.join(home, ".codex", "hooks.json")
+if os.path.exists(hj):
+    try:
+        import re
+        groups = (json.load(open(hj, encoding="utf-8")).get("hooks") or {})
+        ours = [(e, gi, hi) for e, gs in groups.items() if isinstance(gs, list)
+                for gi, g in enumerate(gs) if isinstance(g, dict)
+                for hi, h in enumerate(g.get("hooks") or []) if isinstance(h, dict) and mark in str(h.get("command", ""))]
+        cfg = open(os.path.join(home, ".codex", "config.toml"), encoding="utf-8").read() \
+            if os.path.exists(os.path.join(home, ".codex", "config.toml")) else ""
+        trusted = set()
+        for key, body in re.findall(r'\[hooks\.state\."([^"]+)"\]([^\[]*)', cfg):
+            if "trusted_hash" in body:
+                trusted.add(key)
+        snake = lambda n: re.sub(r"(?<!^)(?=[A-Z])", "_", n).lower()
+        ok = [o for o in ours if "%s:%s:%d:%d" % (hj, snake(o[0]), o[1], o[2]) in trusted]
+        ran = False
+        ev = os.path.join(home, ".local", "state", mark, "events.jsonl")
+        if os.path.exists(ev):
+            ran = any('"agent": "codex"' in l and '"sid"' in l for l in open(ev, encoding="utf-8", errors="replace"))
+        if not ours:
+            print("BAD|" + t("the Codex hooks are missing", "Codex 훅이 빠졌어요") + "|install")
+        elif len(ok) == len(ours) or ran:
+            print("OK|" + t("Codex hooks (%d), trusted", "Codex 훅 (상태 %d개), 신뢰됨") % len(ours))
+        else:
+            print("BAD|" + t("Codex has not trusted the hooks yet, so Codex shows no status (finished turns still notify)",
+                             "Codex 가 훅을 아직 신뢰하지 않아 Codex 상태가 안 보여요(끝난 턴 알림은 와요)")
+                  + "|" + t("open Codex on the host, type /hooks and trust the cmux-remote-notify hooks",
+                            "장비에서 Codex 를 열고 /hooks 에서 cmux-remote-notify 훅을 신뢰해요"))
+    except Exception as e:
+        print("BAD|" + t("could not read the Codex hooks: %s", "Codex 훅을 읽지 못했어요: %s") % e + "|")
+# The agents' own notifications would notify a second time.
+try:
+    sp = os.path.join(home, ".claude", "settings.json")
+    ch = json.load(open(sp, encoding="utf-8")).get("preferredNotifChannel") if os.path.exists(sp) else None
+    if os.path.isdir(os.path.join(home, ".claude")) and ch != "notifications_disabled":
+        print("BAD|" + t("Claude Code's own notifications are on (preferredNotifChannel: %s), so a turn can notify twice",
+                         "Claude Code 자체 알림이 켜져 있어요(preferredNotifChannel: %s). 알림이 두 번 올 수 있어요")
+              % (ch or "auto") + "|install")
+except Exception:
+    pass
+cp = os.path.join(home, ".codex", "config.toml")
+if os.path.exists(cp):
+    import re
+    body = open(cp, encoding="utf-8").read()
+    tui = re.search(r"^\[tui\]\s*$(.*?)(?=^\[|\Z)", body, re.M | re.S)
+    if (tui and re.search(r"^\s*notifications\s*=\s*(true|\[)", tui.group(1), re.M)) \
+            or re.search(r"^\s*tui\.notifications\s*=\s*(true|\[)", body, re.M):
+        print("BAD|" + t("Codex's own notifications are on ([tui] notifications), so a turn can notify twice",
+                         "Codex 자체 알림이 켜져 있어요([tui] notifications). 알림이 두 번 올 수 있어요") + "|install")
 c = os.path.join(home, ".codex", "config.toml")
 if os.path.exists(c):
     lines = open(c, encoding="utf-8").read().split("\n")

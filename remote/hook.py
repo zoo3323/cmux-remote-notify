@@ -6,8 +6,10 @@ or waits for you. It appends one line to ~/.local/state/cmux-remote-notify/event
 On the Mac, `cmux-remote-notify watch` follows that file over SSH, notifies the cmux tab
 the agent is seen from and keeps its sidebar status (Running, Needs input, Idle).
 
-    hook.py claude              # hook JSON arrives on stdin
-    hook.py codex '<json>'      # Codex passes the JSON as the last argument
+    hook.py claude              # Claude Code hooks: JSON on stdin
+    hook.py codex-hook          # Codex hooks: JSON on stdin
+    hook.py codex '<json>'      # Codex notify: JSON as the last argument (finished turns only;
+                                # skipped for sessions the Codex hooks already report)
     hook.py sweep               # called every minute by the Mac's connection: reaps dead Claude
                                 # sessions and reports the ones whose viewers changed
 
@@ -23,7 +25,11 @@ SSH_CONNECTION), an Eternal Terminal login or a mosh login (with its UDP port), 
 started, the server address the Mac connected to and the terminal size.
 Work with no login terminal (scripts, cron, `ssh host cmd`) is ignored. A Claude Code
 background session (/bg, or one started from the agents view) runs under the daemon, so it is
-placed where the client watching it is.
+placed where the client watching it is. Codex works the same way: its sessions run in a shared
+app-server daemon, so a hook called there is placed where the Codex window (TUI) showing that
+session is. With one window on the host that is it; with several, the daemon's log
+(~/.codex/logs_2.sqlite) says which connection opened the session and the window that started
+when that connection opened is the one.
 CMUX_REMOTE_NOTIFY_SESSION forces a session name (`cmux-remote-notify test` and tests), with
 viewers from CMUX_REMOTE_NOTIFY_VIEWERS (JSON). CMUX_REMOTE_NOTIFY_PROC and _DEV replace /proc
 and /dev in tests.
@@ -31,6 +37,7 @@ The hook always exits 0 so it never blocks Claude Code or Codex.
 """
 import json
 import os
+import sqlite3
 import struct
 import re
 import subprocess
@@ -59,6 +66,7 @@ TASK_LIMIT = 80
 DAEMON_DIR = os.path.expanduser("~/.claude/daemon")
 PROC = os.environ.get("CMUX_REMOTE_NOTIFY_PROC", "/proc")
 DEV = os.environ.get("CMUX_REMOTE_NOTIFY_DEV", "/dev")
+CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 # The parent of a login shell names how the terminal is reached.
 LOGIN_VIA = (("sshd", "ssh"), ("etterminal", "et"), ("mosh-server", "mosh"))
 
@@ -140,8 +148,8 @@ def tmux_info(tmux, pane):
 _boot = []
 
 
-def started_at(ticks):
-    """Epoch seconds from a /proc start time in clock ticks."""
+def started_at(ticks, exact=False):
+    """Epoch seconds from a /proc start time in clock ticks (a float with exact=True)."""
     if not _boot:
         try:
             with open(PROC + "/stat") as f:
@@ -152,7 +160,7 @@ def started_at(ticks):
         hz = os.sysconf("SC_CLK_TCK")
     except (ValueError, OSError):
         hz = 100
-    return _boot[0] + int(ticks) // hz
+    return _boot[0] + (int(ticks) / hz if exact else int(ticks) // hz)
 
 
 def udp_port(pid):
@@ -265,6 +273,105 @@ def place(pid, env):
     return v["tty"], [v]
 
 
+def proc_argv(pid):
+    try:
+        with open("%s/%d/cmdline" % (PROC, pid), "rb") as f:
+            return [a for a in f.read().decode("utf-8", "replace").split("\0") if a]
+    except OSError:
+        return []
+
+
+def is_codex(argv):
+    return bool(argv) and os.path.basename(argv[0]) == "codex"
+
+
+def codex_process():
+    """(pid, start, is the app-server daemon) of the Codex process that called this hook."""
+    pid = os.getppid()
+    for _ in range(8):
+        stat = proc_stat(pid) if pid > 1 else None
+        if stat is None:
+            break
+        argv = proc_argv(pid)
+        if is_codex(argv):
+            return pid, stat[1], "app-server" in argv
+        pid = stat[0]
+    return None, None, False
+
+
+def codex_windows():
+    """Pids of the Codex windows (TUI) running in a terminal on this host."""
+    found = []
+    try:
+        names = os.listdir(PROC)
+    except OSError:
+        return found
+    for name in names:
+        if not name.isdigit():
+            continue
+        argv = proc_argv(int(name))
+        if not is_codex(argv) or "app-server" in argv:
+            continue
+        try:
+            tty = os.readlink("%s/%s/fd/0" % (PROC, name))
+        except OSError:
+            continue
+        if tty.startswith("/dev/pts/") or tty.startswith("/dev/tty"):
+            found.append(int(name))
+    return sorted(found)
+
+
+def codex_connection_opened(sid, daemon):
+    """When the daemon's connection that opened (or resumed) this session was opened, from the
+    daemon's log, or None. Only reads the log."""
+    try:
+        db = sqlite3.connect("file:%s/logs_2.sqlite?mode=ro" % CODEX_HOME, uri=True, timeout=1)
+    except sqlite3.Error:
+        return None
+    try:
+        row = db.execute(
+            "select process_uuid, feedback_log_body from logs where thread_id = ? and "
+            "feedback_log_body like '%app_server.connection_id=%' "
+            "order by ts desc, ts_nanos desc, id desc limit 1", (sid,)).fetchone()
+        if not row or not str(row[0]).startswith("pid:%d:" % daemon):
+            return None
+        m = re.search(r"app_server\.connection_id=(\d+)", row[1] or "")
+        if not m:
+            return None
+        got = db.execute(
+            "select ts, ts_nanos from logs where process_uuid = ? and thread_id is null and "
+            "feedback_log_body like ? order by ts desc, ts_nanos desc, id desc limit 1",
+            (row[0], "app-server request: initialize connection_id=ConnectionId(%s)%%" % m.group(1))
+        ).fetchone()
+        return got[0] + got[1] / 1e9 if got else None
+    except sqlite3.Error:
+        return None
+    finally:
+        db.close()
+
+
+def codex_window(sid, daemon):
+    """Pid of the Codex window showing this daemon session, or None."""
+    windows = codex_windows()
+    if len(windows) == 1:
+        return windows[0]
+    if not windows or not sid:
+        return None
+    opened = codex_connection_opened(sid, daemon)
+    if opened is None:
+        return None
+    best = None
+    for pid in windows:
+        stat = proc_stat(pid)
+        if stat is None:
+            continue
+        lag = opened - started_at(stat[1], exact=True)
+        # A window connects within a few seconds of starting.
+        if -1 <= lag <= 30 and (best is None or lag < best[0]):
+            best = (lag, pid)
+    return best[1] if best else None
+
+
 def is_bg_session():
     """Whether the Claude that called this hook is a background session.
 
@@ -374,6 +481,53 @@ def claude_kind(data, sid):
     return None
 
 
+def codex_temporary(sid):
+    """Whether a Codex thread is one Codex runs for itself (naming a conversation, for example).
+    Those are not saved, so they are missing from Codex's thread table. Only reads."""
+    if not sid:
+        return False
+    try:
+        db = sqlite3.connect("file:%s/state_5.sqlite?mode=ro" % CODEX_HOME, uri=True, timeout=1)
+    except sqlite3.Error:
+        return False
+    try:
+        return db.execute("select 1 from threads where id = ?", (sid,)).fetchone() is None
+    except sqlite3.Error:
+        return False
+    finally:
+        db.close()
+
+
+def codex_kind(data, sid):
+    """Turn Codex hook input into (kind, text), or None when there is nothing to report."""
+    name = data.get("hook_event_name")
+    if name == "UserPromptSubmit":
+        lines = [l.strip() for l in str(data.get("prompt") or "").splitlines() if l.strip()]
+        return "running", lines[0][:TASK_LIMIT] if lines else ""
+    if name == "PostToolUse":
+        live = read_live(sid) if sid else {}
+        if live is None or (live or {}).get("state") == "input":
+            return "running", ""
+        return None
+    if name == "PermissionRequest":
+        tool = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+        what = tool.get("description") or tool.get("command") or ""
+        if isinstance(what, list):
+            what = " ".join(str(x) for x in what)
+        return "input", " · ".join(x for x in (str(data.get("tool_name") or ""), str(what)) if x)
+    if name == "Stop":
+        return "done", data.get("last_assistant_message")
+    if name == "Interrupt":
+        return "idle", ""
+    if name == "SessionStart":
+        if data.get("source") == "compact":
+            return None
+        return "idle", ""
+    if name == "SessionEnd":
+        return "end", ""
+    return None
+
+
 def build_event(agent, data):
     """Event dict to record, or None."""
     sid = ""
@@ -385,7 +539,23 @@ def build_event(agent, data):
         if got is None:
             return None
         kind, text = got
+    elif agent == "codex-hook":
+        sid = str(data.get("session_id") or "")
+        if not SID_RE.match(sid):
+            sid = ""
+        if not data.get("transcript_path") and codex_temporary(sid):
+            return None
+        got = codex_kind(data, sid)
+        if got is None:
+            return None
+        kind, text = got
+        agent = "codex"
     elif agent == "codex":
+        # A session the Codex hooks already report is left to them.
+        sid = str(data.get("thread-id") or "")
+        if SID_RE.match(sid) and (read_live(sid) is not None or codex_temporary(sid)):
+            return None
+        sid = ""
         name = data.get("type")
         if name == "agent-turn-complete":
             kind, text = "done", data.get("last-assistant-message")
@@ -440,9 +610,12 @@ def track(event):
         return
     old = read_live(sid) or {}
     info = {"session": event["session"], "name": event.get("name", ""),
-            "viewers": event.get("viewers"), "state": state,
+            "viewers": event.get("viewers"), "state": state, "agent": event["agent"],
             "pid": old.get("pid"), "start": old.get("start")}
-    if not info["pid"] or proc_stat(info["pid"]) is None:
+    if event.get("_pid"):
+        # A Codex session lives as long as the window (or Codex process) showing it.
+        info["pid"], info["start"] = event["_pid"], event["_start"]
+    elif not info["pid"] or proc_stat(info["pid"]) is None:
         info["pid"], info["start"] = claude_process()
     write_live(sid, info)
 
@@ -476,12 +649,12 @@ def sweep():
             if got and got[1] is not None and list(got) != [info.get("session"), info.get("viewers")]:
                 info["session"], info["viewers"] = got
                 write_live(sid, info)
-                append({"v": 1, "ts": int(now * 1000), "agent": "claude", "kind": "where",
+                append({"v": 1, "ts": int(now * 1000), "agent": info.get("agent", "claude"), "kind": "where",
                         "cwd": "", "text": "", "sid": sid, "session": got[0],
                         "name": info.get("name", ""), "viewers": got[1]})
             continue
         remove_live(sid)
-        append({"v": 1, "ts": int(now * 1000), "agent": "claude", "kind": "end",
+        append({"v": 1, "ts": int(now * 1000), "agent": info.get("agent", "claude"), "kind": "end",
                 "cwd": "", "text": "", "sid": sid, "session": info.get("session", "")})
 
 
@@ -490,7 +663,7 @@ def main(argv):
     if agent == "sweep":
         sweep()
         return
-    if agent == "claude":
+    if agent in ("claude", "codex-hook"):
         raw = sys.stdin.read()
     elif agent == "codex":
         raw = argv[2] if len(argv) > 2 else ""
@@ -508,6 +681,20 @@ def main(argv):
     # Claude Code strips some variables from a background session's hooks, so read the
     # environment of the Claude process itself.
     pid = claude_process()[0] if agent == "claude" else None
+    if agent in ("codex", "codex-hook"):
+        pid, start, daemon = codex_process()
+        if daemon:
+            # The session runs in the shared app-server daemon: place it where its window is.
+            sid = event.get("sid", "")
+            live = read_live(sid) if sid else None
+            window = live.get("pid") if live and live.get("pid") and proc_stat(live["pid"]) \
+                and proc_stat(live["pid"])[1] == live.get("start") and live["pid"] != pid else None
+            pid = window or codex_window(sid or str(data.get("thread-id") or ""), pid)
+            if pid is None:
+                return
+            start = proc_stat(pid)[1]
+        if pid and event.get("sid"):
+            event["_pid"], event["_start"] = pid, start
     env = read_environ(pid) if pid else {}
     if not env:
         pid, env = os.getppid(), dict(os.environ)
@@ -520,8 +707,9 @@ def main(argv):
     # Without tmux the key is a terminal (pts/N), so the line is named after the folder.
     if got[1] and [v.get("tty") for v in got[1]] == [got[0]]:
         event["name"] = os.path.basename(event["cwd"].rstrip("/")) or got[0]
+    track_info = {k: event.pop(k) for k in ("_pid", "_start") if k in event}
     append(event)
-    track(event)
+    track(dict(event, **track_info))
 
 
 if __name__ == "__main__":

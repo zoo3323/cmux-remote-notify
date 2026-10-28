@@ -110,6 +110,37 @@ sys.stdout.write(subprocess.run(["python3", "-c", code, sys.argv[1]], env=e, cap
   check "a normal session is not taken for a background one" '[ "$got" = False ]' "$got"
 fi
 
+# Codex hooks
+cx() { local extra=${3:-'{}'}; jq -cn --arg e "$1" --arg sid "${2:-C1}" "{hook_event_name:\$e, session_id:\$sid, cwd:\"/w\", model:\"m\"} + $extra" | hook codex-hook; }
+cx UserPromptSubmit C1 '{prompt:"\n fix the   build\nmore"}'
+check "Codex UserPromptSubmit: running with the prompt's first line" '[ "$(last "[.agent,.kind,.sid,.text]|join(\",\")")" = "codex,running,C1,fix the build" ] && [ "$(jq -r "[.state,.agent]|join(\",\")" "$LIVE/C1")" = "running,codex" ]'
+cx PermissionRequest C1 '{tool_name:"Bash", tool_input:{command:"rm -rf build", description:null}}'
+check "Codex PermissionRequest: input with the tool and command" '[ "$(last "[.kind,.text]|join(\",\")")" = "input,Bash · rm -rf build" ]' "$(tail -n 1 "$EV")"
+cx PostToolUse C1 '{tool_name:"Bash"}'
+check "Codex PostToolUse after the approval: running again" '[ "$(last .kind)" = running ]'
+n=$(lines "$EV"); cx PostToolUse C1 '{tool_name:"Bash"}'
+check "Codex PostToolUse while working writes nothing" '[ "$(lines "$EV")" = "$n" ]'
+hook codex '{"type":"agent-turn-complete","thread-id":"C1","cwd":"/w","last-assistant-message":"Done"}'
+check "Codex notify for a session the hooks report is skipped" '[ "$(lines "$EV")" = "$n" ]'
+cx Stop C1 '{last_assistant_message:"Built.", stop_hook_active:false}'
+check "Codex Stop: done with the last message" '[ "$(last "[.kind,.text]|join(\",\")")" = "done,Built." ] && [ "$(jq -r .state "$LIVE/C1")" = idle ]'
+cx Interrupt C1; check "Codex Interrupt: idle" '[ "$(last .kind)" = idle ]'
+n=$(lines "$EV"); cx SessionStart C1 '{source:"compact"}'
+check "Codex SessionStart from compact writes nothing" '[ "$(lines "$EV")" = "$n" ]'
+cx SessionEnd C1 '{reason:"other"}'
+check "Codex SessionEnd: end, live removed" '[ "$(last .kind)" = end ] && [ ! -e "$LIVE/C1" ]'
+python3 - "$TMP/codexstate/state_5.sqlite" <<'PYDB'
+import os, sqlite3, sys
+os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)
+db = sqlite3.connect(sys.argv[1]); db.execute("create table threads (id text primary key, title text)")
+db.execute("insert into threads values ('C1', 'x')"); db.commit()
+PYDB
+n=$(lines "$EV"); CODEX_HOME=$TMP/codexstate hook codex '{"type":"agent-turn-complete","thread-id":"T-title","cwd":"/w","last-assistant-message":"{\"title\":\"x\"}"}'
+jq -cn '{hook_event_name:"UserPromptSubmit", session_id:"T-title", cwd:"/w", transcript_path:null, prompt:"Generate a title"}' | CODEX_HOME=$TMP/codexstate hook codex-hook
+check "Codex's own unsaved threads (naming a conversation) are skipped" '[ "$(lines "$EV")" = "$n" ]'
+CODEX_HOME=$TMP/codexstate hook codex '{"type":"agent-turn-complete","thread-id":"C1","cwd":"/w","last-assistant-message":"Done"}'
+check "Codex notify still reports when no hook does" '[ "$(last "[.agent,.kind,.text]|join(\",\")")" = "codex,done,Done" ]'
+
 # where an agent is seen from, on a made-up /proc
 P=$TMP/proc; mkdir -p "$P"; echo "btime 1000" > "$P/stat"
 HZ=$(python3 -c 'import os; print(os.sysconf("SC_CLK_TCK"))')
@@ -145,6 +176,29 @@ check "a detached tmux session is seen from nowhere" '[ "$(place 320)" = "[\"mon
 check "mosh: the terminal, with the server UDP port and address" '[ "$(place 350)" = "[\"pts/3\",[{\"via\":\"mosh\",\"start\":1086,\"tty\":\"pts/3\",\"sip\":\"10.0.0.9\",\"mport\":60001}]]" ]' "$(place 350)"
 check "no login (cron, scripts) is ignored" '[ "$(place 330)" = null ]' "$(place 330)"
 check "ssh host cmd without a terminal is ignored" '[ "$(place 340)" = null ]' "$(place 340)"
+# Codex sessions run in a shared app-server daemon: find the window (TUI) showing them
+mkproc 400 1 codex 100; printf '%s\0' codex app-server --listen unix:// > "$P/400/cmdline"
+mkproc 410 200 codex 200 /dev/pts/4; printf '%s\0' /home/me/.local/bin/codex > "$P/410/cmdline"
+win() { CMUX_REMOTE_NOTIFY_PROC=$P CODEX_HOME=$TMP/codexhome python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import hook
+print(hook.codex_windows(), hook.codex_window(sys.argv[2], 400))' "$ROOT/remote" "$1"; }
+check "one Codex window on the host: it shows the session" '[ "$(win T1)" = "[410] 410" ]' "$(win T1)"
+mkproc 420 210 codex 300 /dev/pts/1; printf '%s\0' codex > "$P/420/cmdline"
+mkdir -p "$TMP/codexhome"
+python3 - "$TMP/codexhome/logs_2.sqlite" <<'PYDB'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("create table logs (id integer primary key, ts int, ts_nanos int, level text, target text, feedback_log_body text, module_path text, file text, line int, thread_id text, process_uuid text, estimated_bytes int)")
+d = "pid:400:abc"
+rows = [(1200, 500000000, None, d, "app-server request: initialize connection_id=ConnectionId(7) request_id=1"),
+        (1300, 400000000, None, d, "app-server request: initialize connection_id=ConnectionId(8) request_id=1"),
+        (1301, 0, "T2", d, 'app_server.request{rpc.method="thread/start" app_server.connection_id=8 app_server.client_name="codex-tui"}:x'),
+        (1202, 0, "T3", d, 'app_server.request{rpc.method="thread/start" app_server.connection_id=7 app_server.client_name="codex-tui"}:x')]
+for ts, ns, tid, pu, body in rows:
+    db.execute("insert into logs (ts, ts_nanos, level, target, feedback_log_body, thread_id, process_uuid) values (?,?,?,?,?,?,?)", (ts, ns, "INFO", "t", body, tid, pu))
+db.commit()
+PYDB
+check "two windows: the one that started when the session's connection opened" '[ "$(win T2)" = "[410, 420] 420" ] && [ "$(win T3)" = "[410, 420] 410" ]' "$(win T2) / $(win T3)"
+check "two windows and no log entry for the session: no guess" '[ "$(win T9)" = "[410, 420] None" ]' "$(win T9)"
 LV=$H/.local/state/cmux-remote-notify/live; mkdir -p "$LV"
 printf '{"session":"monitor","name":"","viewers":[],"state":"idle","pid":320,"start":"%s"}' $(( 95 * HZ )) > "$LV/W1"
 printf 'train\n211\n' > "$TMP/tmux.out"
@@ -188,10 +242,15 @@ setup() { HOME="$S" python3 - "$@" < "$SETUP"; }
 
 out=$(setup install)
 SJ=$S/.claude/settings.json
+CJ=$S/.codex/hooks.json
+check "Codex hooks: one entry in each of 7 events, Interrupt and SessionEnd at 3 seconds" '[ "$(jq -c "[.hooks | to_entries[] | select(any(.value[].hooks[]; .command|test(\"cmux-remote-notify/hook.py codex-hook\"))) | .key] | sort" "$CJ")" = "[\"Interrupt\",\"PermissionRequest\",\"PostToolUse\",\"SessionEnd\",\"SessionStart\",\"Stop\",\"UserPromptSubmit\"]" ] && [ "$(jq -c "[.hooks.Interrupt[0].hooks[0].timeout, .hooks.SessionEnd[0].hooks[0].timeout]" "$CJ")" = "[3,3]" ]' "$(cat "$CJ" 2>/dev/null)"
+check "the install output says to trust the Codex hooks with /hooks" 'echo "$out" | grep -q "/hooks"' "$out"
 check "one entry in each of the 7 hook events" '[ "$(jq -c "[.hooks | to_entries[] | select(any(.value[].hooks[]; .command|test(\"cmux-remote-notify/hook.py claude\"))) | .key] | sort" "$SJ")" = "[\"Notification\",\"PostToolUse\",\"SessionEnd\",\"SessionStart\",\"Stop\",\"StopFailure\",\"UserPromptSubmit\"]" ]' "$(jq -c .hooks "$SJ")"
 check "PostToolUse: every tool, 5 second timeout" '[ "$(jq -c "[.hooks.PostToolUse[] | select(any(.hooks[]; .command|test(\"cmux-remote-notify\"))) | [.matcher, .hooks[0].timeout]]" "$SJ")" = "[[\"\",5]]" ]'
 check "other hooks and settings stay" '[ "$(jq -c "[.hooks.Stop[0], .hooks.PreToolUse, .permissions, .theme]" "$SJ")" = "$(jq -c "[.hooks.Stop[0], .hooks.PreToolUse, .permissions, .theme]" "$TMP/settings.orig")" ]'
-check "Codex notify goes at the top, before the first [table]" 'sed -n 2p "$S/.codex/config.toml" | grep -q "^notify = \[\".*cmux-remote-notify/hook.py\", \"codex\"\]$" && [ "$(sed -n "3,\$p" "$S/.codex/config.toml")" = "$(cat "$TMP/config.orig")" ]'
+check "Codex notify goes at the top, before the first [table]" 'sed -n 2p "$S/.codex/config.toml" | grep -q "^notify = \[\".*cmux-remote-notify/hook.py\", \"codex\"\]$" && [ "$(sed -n "3,\$p" "$S/.codex/config.toml" | sed "/^\[tui\]$/,\$d")" = "$(cat "$TMP/config.orig")" ]' "$(cat "$S/.codex/config.toml")"
+check "Codex's own notifications are turned off (a [tui] table it did not have)" '[ "$(sed -n "/^\[tui\]$/,\$p" "$S/.codex/config.toml" | grep -c "^notifications = false$")" = 1 ]'
+check "Claude Code's own notifications are turned off" '[ "$(jq -r .preferredNotifChannel "$SJ")" = notifications_disabled ]'
 check "files are backed up before they change" 'ls "$S/.claude/" | grep -q "settings.json.bak.cmux-remote-notify." && ls "$S/.codex/" | grep -q "config.toml.bak.cmux-remote-notify."'
 check "the Codex config still parses as TOML" 'python3 -c "import sys,tomllib; tomllib.load(open(sys.argv[1],\"rb\"))" "$S/.codex/config.toml" 2>/dev/null || ! python3 -c "import tomllib" 2>/dev/null'
 
@@ -203,9 +262,25 @@ check "Korean output with ko" 'echo "$out" | grep -q "Claude Code: 바꿀 것 �
 setup uninstall >/dev/null
 check "uninstall restores the Claude settings" 'cmp -s "$SJ" "$TMP/settings.orig"'
 check "uninstall restores the Codex config" 'cmp -s "$S/.codex/config.toml" "$TMP/config.orig"'
+check "uninstall leaves no Codex hooks of ours" '! grep -q cmux-remote-notify "$CJ"' "$(cat "$CJ")"
 printf '# cmux-remote-notify: Codex 작업이 끝나면 맥 cmux 탭에 알린다\nnotify = ["%s/.local/share/cmux-remote-notify/hook.py", "codex"]\nmodel = "x"\n' "$S" > "$S/.codex/config.toml"
 setup uninstall >/dev/null
 check "uninstall also removes the comment older versions wrote" '[ "$(cat "$S/.codex/config.toml")" = "model = \"x\"" ]' "$(cat "$S/.codex/config.toml")"
+
+# someone who had the agents' own notifications on
+S2=$TMP/setuphome2; mkdir -p "$S2/.claude" "$S2/.codex"
+printf '{\n  "preferredNotifChannel": "iterm2",\n  "theme": "dark"\n}\n' > "$S2/.claude/settings.json"
+printf 'model = "x"\n\n[tui]\nnotifications = true\nnotification_method = "osc9"\n\n[projects."/a"]\ntrust_level = "trusted"\n' > "$S2/.codex/config.toml"
+cp "$S2/.claude/settings.json" "$TMP/s2.orig"; cp "$S2/.codex/config.toml" "$TMP/c2.orig"
+setup2() { HOME="$S2" python3 - "$@" < "$SETUP"; }
+setup2 install >/dev/null; setup2 install >/dev/null
+check "stock on: install turns both off (installing twice keeps the original)" '[ "$(jq -r .preferredNotifChannel "$S2/.claude/settings.json")" = notifications_disabled ] && grep -q "^notifications = false$" "$S2/.codex/config.toml" && ! grep -q "^notifications = true$" "$S2/.codex/config.toml" && grep -q "^notification_method = \"osc9\"$" "$S2/.codex/config.toml"' "$(cat "$S2/.codex/config.toml")"
+check "the Codex config with notifications off still parses as TOML" 'python3 -c "import sys,tomllib; d=tomllib.load(open(sys.argv[1],\"rb\")); assert d[\"tui\"][\"notifications\"] is False" "$S2/.codex/config.toml" 2>/dev/null || ! python3 -c "import tomllib" 2>/dev/null'
+out=$(setup2 uninstall)
+check "uninstall puts both back exactly" 'cmp -s "$S2/.claude/settings.json" "$TMP/s2.orig" && cmp -s "$S2/.codex/config.toml" "$TMP/c2.orig"' "$(diff "$S2/.codex/config.toml" "$TMP/c2.orig"; diff "$S2/.claude/settings.json" "$TMP/s2.orig")"
+check "uninstall says it put them back" 'echo "$out" | grep -q "put back its own notifications (preferredNotifChannel)" && echo "$out" | grep -q "put back its own notifications (\[tui\] notifications)"' "$out"
+setup2 install >/dev/null; jq '.preferredNotifChannel = "kitty"' "$S2/.claude/settings.json" > "$S2/x" && mv "$S2/x" "$S2/.claude/settings.json"; setup2 uninstall >/dev/null
+check "a value the user changed after install is left alone" '[ "$(jq -r .preferredNotifChannel "$S2/.claude/settings.json")" = kitty ]'
 
 printf 'notify = ["my-notifier"]\nmodel = "x"\n' > "$S/.codex/config.toml"
 out=$(setup install)
