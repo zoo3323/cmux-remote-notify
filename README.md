@@ -14,7 +14,7 @@
   <img src="docs/img/hero-light.svg" alt="You work in a local cmux workspace. Further down the sidebar, the remote ml-research workspace gets an unread badge and a banner when train finishes and when eval needs input." width="100%">
 </picture>
 
-Keep working in another tab. When an agent on a remote server (over SSH, [Eternal Terminal](https://eternalterminal.dev/) or [mosh](https://mosh.org), in tmux or not) finishes or needs you, [cmux](https://cmux.com) tells you: a banner, an unread badge on that workspace, the ring on its tab, and a sidebar line saying what each session is doing. On its own, cmux hears a remote agent only through terminal escape codes: mosh drops them, tmux drops them unless passthrough is on, Claude Code sends them only after about a minute, and a closed tab gets nothing. This tool reports every turn the moment it ends, the same way over any connection.
+When a remote agent finishes or needs you, [cmux](https://cmux.com) shows it on that tab, even while you work elsewhere. SSH, [Eternal Terminal](https://eternalterminal.dev/) or [mosh](https://mosh.org), in tmux or not.
 
 ## Install
 
@@ -25,7 +25,7 @@ bin/cmux-remote-notify install gpu-box     # the name you give ssh
 cmux-remote-notify test gpu-box            # a test notification on that tab
 ```
 
-Run `install` once per host. It adds hooks on the host and a watcher on your Mac that starts at login and reconnects after sleep. For Codex, open Codex on the host once, type `/hooks` and trust the cmux-remote-notify hooks; until then Codex sends finished turns only, with no sidebar status.
+Run `install` once per host. For Codex, also trust the hooks once in Codex (`/hooks`).
 
 | Where | Needs |
 |---|---|
@@ -107,6 +107,10 @@ Logs: `~/Library/Logs/cmux-remote-notify/<host>.log` on the Mac, `~/.local/state
 
 <details>
 <summary><b>Details</b></summary>
+
+Why not cmux alone: it hears a remote agent only through terminal escape codes, which mosh drops, tmux drops unless passthrough is on, and Claude Code sends only after about a minute. This tool reports every turn the moment it ends, over any connection.
+
+The watcher starts at login and reconnects after sleep. Until the Codex hooks are trusted, Codex sends finished turns only, with no sidebar status.
 
 Messages and sidebar text follow your macOS language, English or Korean. `CMUX_REMOTE_NOTIFY_LANG=en` forces English.
 

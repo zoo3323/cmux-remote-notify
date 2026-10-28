@@ -14,7 +14,7 @@
   <img src="docs/img/hero-light.ko.svg" alt="로컬 작업 공간에서 일하는 동안, 사이드바 아래 원격 ml-research 작업 공간에 train 완료와 eval 확인 필요 때마다 읽지 않은 배지와 배너가 뜬다" width="100%">
 </picture>
 
-다른 탭에서 하던 일을 계속하세요. 원격 서버(SSH, [Eternal Terminal](https://eternalterminal.dev/), [mosh](https://mosh.org) 로 붙음, tmux 는 써도 안 써도 됨)의 에이전트가 일을 끝내거나 확인을 기다리면 [cmux](https://cmux.com) 가 알려 줍니다. 맥 배너가 뜨고, 그 작업 공간에 읽지 않은 배지와 탭 테두리가 붙고, 사이드바에 세션마다 지금 하는 일이 보입니다. 순정 cmux 는 원격 에이전트를 터미널 신호로만 알아챕니다. mosh 는 그 신호를 버리고, tmux 는 passthrough 를 켜지 않으면 버리고, Claude Code 는 1분쯤 지나서야 보내고, 닫은 탭에는 아무것도 오지 않습니다. 이 도구는 어떤 접속이든 턴이 끝나는 즉시 같은 방식으로 알립니다.
+원격 에이전트가 일을 끝내거나 확인을 기다리면, 다른 탭에서 일하는 중에도 [cmux](https://cmux.com) 가 그 탭에 알려 줍니다. SSH, [Eternal Terminal](https://eternalterminal.dev/), [mosh](https://mosh.org) 모두, tmux 는 써도 안 써도 됩니다.
 
 ## 설치
 
@@ -25,7 +25,7 @@ bin/cmux-remote-notify install gpu-box     # ssh 로 붙는 이름
 cmux-remote-notify test gpu-box            # 그 탭에 시험 알림
 ```
 
-`install` 은 장비마다 한 번입니다. 장비에는 훅을, 맥에는 로그인할 때 켜지고 잠자기 뒤 스스로 다시 붙는 감시 프로그램을 넣습니다. Codex 는 장비에서 Codex 를 한 번 열고 `/hooks` 에서 cmux-remote-notify 훅을 신뢰해 주세요. 그 전에는 끝난 턴 알림만 오고 사이드바 상태는 보이지 않습니다.
+`install` 은 장비마다 한 번입니다. Codex 는 Codex 에서 훅을 한 번 신뢰해 주세요(`/hooks`).
 
 | 어디 | 필요한 것 |
 |---|---|
@@ -107,6 +107,10 @@ ssh me@10.0.0.9                        # 같은 장비를 주소로
 
 <details>
 <summary><b>더 자세히</b></summary>
+
+순정 cmux 와의 차이: 순정은 원격 에이전트를 터미널 신호로만 알아채는데, mosh 는 그 신호를 버리고, tmux 는 passthrough 를 켜지 않으면 버리고, Claude Code 는 1분쯤 지나서야 보냅니다. 이 도구는 어떤 접속이든 턴이 끝나는 즉시 알립니다.
+
+맥 감시 프로그램은 로그인할 때 켜지고 잠자기 뒤 스스로 다시 붙습니다. Codex 훅을 신뢰하기 전에는 끝난 턴 알림만 오고 사이드바 상태는 보이지 않습니다.
 
 안내 문구와 사이드바 글자는 macOS 언어를 따릅니다(영어, 한국어). `CMUX_REMOTE_NOTIFY_LANG=en` 이면 영어로 고정합니다.
 
