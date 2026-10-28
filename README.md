@@ -14,7 +14,7 @@
   <img src="docs/img/hero-light.svg" alt="You work in a local cmux workspace. Further down the sidebar, the remote ml-research workspace gets an unread badge and a banner when train finishes and when eval needs input." width="100%">
 </picture>
 
-Keep working in another tab. When an agent on a remote server (tmux over SSH or [Eternal Terminal](https://eternalterminal.dev/)) finishes or needs you, [cmux](https://cmux.com) tells you: a banner, an unread badge on that workspace, the ring on its tab, and a sidebar line saying what each session is doing. Without this, remote agents are invisible to cmux.
+Keep working in another tab. When an agent on a remote server (over SSH, [Eternal Terminal](https://eternalterminal.dev/) or [mosh](https://mosh.org), in tmux or not) finishes or needs you, [cmux](https://cmux.com) tells you: a banner, an unread badge on that workspace, the ring on its tab, and a sidebar line saying what each session is doing. Without this, remote agents are invisible to cmux.
 
 ## Install
 
@@ -31,7 +31,7 @@ Run `install` once per host. It adds hooks on the host and a watcher on your Mac
 |---|---|
 | Mac | cmux, `jq` (built into macOS 15, or `brew install jq`), an SSH key that logs in to the host without a password |
 | cmux | Settings › Automation › Socket control mode: **Automation** |
-| Host | Linux with `python3`, Claude Code inside **tmux**. Codex works too (notifications only) |
+| Host | Linux with `python3` and Claude Code, in tmux or not. Codex works too (notifications only) |
 
 ## The sidebar
 
@@ -40,7 +40,7 @@ Run `install` once per host. It adds hooks on the host and a watcher on your Mac
   <img src="docs/img/states-light.svg" alt="Three sidebar lines: Running with the time worked and the prompt, Needs input, Idle" width="100%">
 </picture>
 
-One line per tmux session, on the workspace that holds its tab. The workspace description names the host; `install gpu-box --label GPU` shows it as `GPU`.
+One line per tmux session, or per tab running Claude without tmux (named after its folder), on the workspace that holds the tab. The workspace description names the host; `install gpu-box --label GPU` shows it as `GPU`.
 
 ## How it works
 
@@ -49,13 +49,20 @@ One line per tmux session, on the workspace that holds its tab. The workspace de
   <img src="docs/img/flow-light.svg" alt="On the host, Claude Code hooks run hook.py, which appends to events.jsonl. The Mac's watcher follows that file over SSH and calls cmux notify and set-status." width="100%">
 </picture>
 
-The hook only appends a line to a file, so it never slows the agent down and nothing listens on a port. The Mac keeps one SSH connection per host. A tab is matched by the `ssh` or `et` command running in it:
+The hook only appends a line to a file, so it never slows the agent down and nothing listens on a port. The Mac keeps one SSH connection per host.
+
+Nothing has to be set up per tab. The hook says which logins the agent is seen from (for tmux, the clients attached to its session), and the Mac finds the tab that opened each login: an ssh login by its port, a mosh login by its UDP port, et and shared ssh connections (ControlMaster, ProxyJump) by when the login started, and logins started within two seconds of each other by terminal size. A tab may name the host differently (`user@address`, another alias); the address it is connected to tells it is the same host. A tmux session named on the command line is matched by name. All of these work:
 
 ```bash
+ssh gpu-box                            # then claude, or tmux by hand
 ssh -t gpu-box tmux new -A -s train
+et gpu-box                             # then claude
 et gpu-box -c "tmux attach -t train"
-ssh gpu-box        # then tmux by hand: works when it is the only tab on that host
+mosh gpu-box                           # then claude
+ssh me@10.0.0.9                        # the same host by its address
 ```
+
+A detached tmux session shows on no tab until you attach it again.
 
 ## Commands
 
@@ -77,7 +84,7 @@ Start with `cmux-remote-notify doctor`. It checks the watcher, the cmux socket m
 |---|---|---|
 | Nothing arrives | watcher stopped, or hooks missing | `install <host>` again |
 | `test` works, real work does not | another tool rewrote the host's `~/.claude/settings.json` | `install <host>` again |
-| Banner only, no tab ring | no tab is attached to that session | open the session with one of the commands above |
+| Banner only, no tab ring | no open tab shows that agent (a detached tmux session) | attach to it from a tab |
 | Stopped after a cmux update | socket control mode went back to "cmux processes only" | set it to Automation |
 | Running stays after Esc | Esc sends no `Stop` | it turns Idle about a minute later |
 
@@ -101,7 +108,9 @@ Logs: `~/Library/Logs/cmux-remote-notify/<host>.log` on the Mac, `~/.local/state
 
 Messages and sidebar text follow your macOS language, English or Korean. `CMUX_REMOTE_NOTIFY_LANG=en` forces English.
 
-Claude Code background sessions (`/bg`) run outside tmux; their status goes to the tab of the Claude client that is watching them.
+Claude Code background sessions (`/bg`) run under a daemon; their status goes to the tab of the Claude client that is watching them.
+
+Not matched: two tabs to one host whose logins started within two seconds of each other and have the same terminal size, when neither the port nor a tmux session name tells them apart.
 
 After the Mac sleeps, the watcher is back within about a minute, and events from the gap still arrive (older than 10 minutes: tab ring only, no banner). The host sends a heartbeat every minute so a dead connection never lingers there.
 

@@ -24,6 +24,8 @@ lines() { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
 echo "hook.py"
 H=$TMP/hookhome; mkdir -p "$H"
 EV=$H/.local/state/cmux-remote-notify/events.jsonl
+# An empty /proc unless a test builds one, so the machine running the tests is never looked at.
+export CMUX_REMOTE_NOTIFY_PROC=$TMP/noproc CMUX_REMOTE_NOTIFY_DEV=$TMP/nodev
 hook() { env -u TMUX HOME="$H" CMUX_REMOTE_NOTIFY_SESSION="${SESSION-s1}" python3 "$HOOK" "$@"; }
 
 long=$(python3 -c 'print("first line\n\n  second   line " + "é" * 400)')
@@ -99,7 +101,7 @@ check "background session: records of dead clients are ignored" '[ "$(lines "$EV
 if [ -d /proc/self ]; then
   # Claude Code strips CLAUDE_CODE_SESSION_KIND from a background session's hooks; read the calling claude's env.
   BGPY='import os, subprocess, sys
-e = dict(os.environ); e.pop("CLAUDE_CODE_SESSION_KIND", None)
+e = dict(os.environ); e.pop("CLAUDE_CODE_SESSION_KIND", None); e.pop("CMUX_REMOTE_NOTIFY_PROC", None)
 code = "import sys; sys.path.insert(0, sys.argv[1]); import hook; print(hook.is_bg_session())"
 sys.stdout.write(subprocess.run(["python3", "-c", code, sys.argv[1]], env=e, capture_output=True, text=True).stdout)'
   got=$(env CLAUDE_CODE_SESSION_KIND=bg bash -c 'exec -a claude python3 -c "$1" "$2"' _ "$BGPY" "$ROOT/remote")
@@ -107,6 +109,50 @@ sys.stdout.write(subprocess.run(["python3", "-c", code, sys.argv[1]], env=e, cap
   got=$(env -u CLAUDE_CODE_SESSION_KIND bash -c 'exec -a claude python3 -c "$1" "$2"' _ "$BGPY" "$ROOT/remote")
   check "a normal session is not taken for a background one" '[ "$got" = False ]' "$got"
 fi
+
+# where an agent is seen from, on a made-up /proc
+P=$TMP/proc; mkdir -p "$P"; echo "btime 1000" > "$P/stat"
+HZ=$(python3 -c 'import os; print(os.sysconf("SC_CLK_TCK"))')
+# mkproc PID PPID COMM START_SECONDS_AFTER_BOOT [fd0] [environ, ; separated]
+mkproc() {
+  mkdir -p "$P/$1/fd"
+  printf '%s (%s) S %s 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 %s 0 0\n' "$1" "$3" "$2" $(( $4 * HZ )) > "$P/$1/stat"
+  echo "$3" > "$P/$1/comm"; printf '%s\0' "$3" > "$P/$1/cmdline"
+  [ -z "${5:-}" ] || ln -sf "$5" "$P/$1/fd/0"
+  : > "$P/$1/environ"; [ -z "${6:-}" ] || (IFS=';'; printf '%s\0' $6 > "$P/$1/environ")
+}
+mkproc 100 1 sshd 50
+mkproc 200 100 bash 60 /dev/pts/4 "SSH_CONNECTION=10.0.0.2 50123 10.0.0.9 22"
+mkproc 300 200 claude 70 /dev/pts/4
+mkproc 110 1 etterminal 80
+mkproc 210 110 bash 81 /dev/pts/1
+mkproc 211 210 tmux 90 /dev/pts/1
+mkproc 320 999 claude 95 /dev/pts/9 "TMUX=/tmp/s,999,0;TMUX_PANE=%1"
+mkproc 330 1 claude 99
+mkproc 340 100 claude 99 pipe:[1]
+mkproc 120 1 mosh-server 85; ln -sf "socket:[777]" "$P/120/fd/4"; mkdir -p "$P/120/net"
+printf '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   1: 0900000A:EA61 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 777 2\n' > "$P/120/net/udp"
+mkproc 220 120 bash 86 /dev/pts/3 "SSH_CONNECTION=10.0.0.2 50999 10.0.0.9 22"
+mkproc 350 220 claude 99 /dev/pts/3
+mkdir -p "$TMP/faketmux"; printf '#!/bin/bash\ncat "%s/tmux.out"\n' "$TMP" > "$TMP/faketmux/tmux"; chmod 755 "$TMP/faketmux/tmux"
+printf 'train\n211\n' > "$TMP/tmux.out"
+place() { CMUX_REMOTE_NOTIFY_PROC=$P PATH="$TMP/faketmux:$PATH" python3 -c 'import sys, json; sys.path.insert(0, sys.argv[1]); import hook
+print(json.dumps(hook.place(int(sys.argv[2]), hook.read_environ(int(sys.argv[2]))), separators=(",", ":")))' "$ROOT/remote" "$1"; }
+check "plain ssh: the terminal, with the Mac port and login time" '[ "$(place 300)" = "[\"pts/4\",[{\"via\":\"ssh\",\"start\":1060,\"tty\":\"pts/4\",\"sip\":\"10.0.0.9\",\"port\":50123,\"sport\":22}]]" ]' "$(place 300)"
+check "tmux: the session, seen from its attached client (an et login)" '[ "$(place 320)" = "[\"train\",[{\"via\":\"et\",\"start\":1081,\"tty\":\"pts/1\"}]]" ]' "$(place 320)"
+printf 'monitor\n' > "$TMP/tmux.out"
+check "a detached tmux session is seen from nowhere" '[ "$(place 320)" = "[\"monitor\",[]]" ]' "$(place 320)"
+check "mosh: the terminal, with the server UDP port and address" '[ "$(place 350)" = "[\"pts/3\",[{\"via\":\"mosh\",\"start\":1086,\"tty\":\"pts/3\",\"sip\":\"10.0.0.9\",\"mport\":60001}]]" ]' "$(place 350)"
+check "no login (cron, scripts) is ignored" '[ "$(place 330)" = null ]' "$(place 330)"
+check "ssh host cmd without a terminal is ignored" '[ "$(place 340)" = null ]' "$(place 340)"
+LV=$H/.local/state/cmux-remote-notify/live; mkdir -p "$LV"
+printf '{"session":"monitor","name":"","viewers":[],"state":"idle","pid":320,"start":"%s"}' $(( 95 * HZ )) > "$LV/W1"
+printf 'train\n211\n' > "$TMP/tmux.out"
+HOME="$H" CMUX_REMOTE_NOTIFY_PROC=$P PATH="$TMP/faketmux:$PATH" python3 "$HOOK" sweep
+check "sweep: a session attached somewhere else sends where" '[ "$(last "[.kind,.sid,.session,(.viewers|length)]|join(\",\")")" = "where,W1,train,1" ] && [ "$(jq -r .session "$LV/W1")" = train ]' "$(tail -n 1 "$EV")"
+n=$(lines "$EV"); HOME="$H" CMUX_REMOTE_NOTIFY_PROC=$P PATH="$TMP/faketmux:$PATH" python3 "$HOOK" sweep
+check "sweep: nothing changed, nothing sent" '[ "$(lines "$EV")" = "$n" ]'
+rm -f "$LV/W1"
 
 python3 -c "import sys; open(sys.argv[1], 'a').write('x' * 600000 + '\n')" "$EV"
 echo '{"hook_event_name":"Stop","last_assistant_message":"new file"}' | hook claude
@@ -171,12 +217,17 @@ echo "finding tabs"
 F=$TMP/fake; mkdir -p "$F"
 cat > "$F/ps" <<'EOF'
 #!/bin/bash
+# ps.txt lines are "tty [etime pid] args"; without them one day and a made-up pid are used.
 case "$*" in
-  *tty=*) cat "$FAKE_DIR/ps.txt" ;;
+  *tty=*) awk '$2 !~ /^[0-9-]+(:[0-9]+)+$/ { $1 = $1 " 1-00:00:00 " (5000 + NR) } { print }' "$FAKE_DIR/ps.txt" ;;
+  *pid=,args=*) [ -f "$FAKE_DIR/psargs.txt" ] && cat "$FAKE_DIR/psargs.txt" ;;
   *) sed -E 's/^[^ ]+ +//' "$FAKE_DIR/ps.txt" ;;
 esac
 EOF
 chmod 755 "$F/ps"
+printf '#!/bin/bash\n[ -f "$FAKE_DIR/lsof.txt" ] && cat "$FAKE_DIR/lsof.txt"\nexit 0\n' > "$F/lsof"; chmod 755 "$F/lsof"
+# stty -f /dev/TTY size: from sizes.txt lines "TTY rows cols"
+printf '#!/bin/bash\nt=${2#/dev/}; [ -f "$FAKE_DIR/sizes.txt" ] && awk -v t="$t" '"'"'$1 == t { print $2, $3; f = 1 } END { exit !f }'"'"' "$FAKE_DIR/sizes.txt"\n' > "$F/stty"; chmod 755 "$F/stty"
 cat > "$F/ps.txt" <<'EOF'
 ttys001  /Users/me/.local/share/ezet/et/current --close-on-hangup -p 2022 gpu-box -c '/usr/local/bin/tmux' -L 'ezet-x' new-session -A -s 'train'
 ttys002  ssh -t gpu-box tmux new -A -s api
@@ -187,14 +238,18 @@ ttys006  ssh -W gpu-box:22 jump
 ttys007  /bin/zsh -c grep -F " gpu-box " | grep new-session -s 'train'
 ??       ssh -o BatchMode=yes -n gpu-box tail -F x
 ttys008  ssh -t lab tmux -L sock new-session -d -s side \; attach -t main
+ttys009  /opt/homebrew/bin/mosh-client -# --ssh=ssh -p 2222 me@gpu-box tmux a -t m | 10.0.0.9 60001
 EOF
-tabs() { FAKE_DIR="$F" PATH="$F:$PATH" bash "$CLI" _tabs gpu-box | tr '\t' '|'; }
+tabs() { FAKE_DIR="$F" PATH="$F:$PATH" bash "$CLI" _tabs gpu-box | cut -f 1-3 | tr '\t' '|'; }
+started() { FAKE_DIR="$F" PATH="$F:$PATH" CMUX_REMOTE_NOTIFY_NOW=200000 bash "$CLI" _tabs gpu-box | grep "^$1" | cut -f 4; }
+check "when the connection began, from ps etime" '[ "$(started ttys005)" = 113600 ]' "$(started ttys005)"
 check "ezet's et command line" 'tabs | grep -qx "ttys001|gpu-box|train"' "$(tabs)"
 check "ssh -t host tmux new -A -s NAME" 'tabs | grep -qx "ttys002|gpu-box|api"'
 check "ssh with options, user@, tmux attach -t NAME:window" 'tabs | grep -qx "ttys003|gpu-box|notes"'
 check "et -c before the host, host:port, quoted name with a space" 'tabs | grep -qx "ttys004|gpu-box|big run"'
 check "plain ssh: host known, session empty" 'tabs | grep -qx "ttys005|gpu-box|"'
 check "ssh -W jumps, shells and tty-less ssh are ignored" '! tabs | grep -qE "^(ttys006|ttys007|\?\?)"'
+check "mosh-client: host, session, server address and UDP port" 'FAKE_DIR="$F" PATH="$F:$PATH" bash "$CLI" _tabs gpu-box | cut -f 1-3,6- | tr "\t" "|" | grep -qx "ttys009|gpu-box|m|mosh|10.0.0.9|60001"' "$(tabs)"
 check "a later attach after ; wins" 'tabs | grep -qx "ttys008|lab|main"' "$(tabs)"
 
 # ---------------------------------------------------------------- watch: events
@@ -271,7 +326,7 @@ check "test picks a session from a connection (shells ignored)" '[ "$(pick gpu-b
 # ---------------------------------------------------------------- watch: sidebar
 echo "watch (sidebar)"
 G=$TMP/fake2; mkdir -p "$G/st"
-cp "$F/ps" "$F/osascript" "$G/"
+cp "$F/ps" "$F/lsof" "$F/stty" "$F/osascript" "$G/"
 cat > "$G/cmux" <<'EOF'
 #!/bin/bash
 # Fake cmux: status lives in st/<workspace> as "key=text icon=.. color=.. [work=..] [priority=..]", descriptions in desc.json.
@@ -402,6 +457,74 @@ check "lines replayed on reconnect are skipped" '[ "$(lines "$G/status.log")" = 
 printf '%s' "$a" | jq .ts > "$ST/old.last"
 n=$(lines "$G/notify.log"); FAKE_DIR="$G" PATH="$G:$PATH" CMUX_BIN="$G/cmux" CMUX_REMOTE_NOTIFY_STATE="$ST" bash "$CLI" _handle old "$a" >/dev/null
 check "a last file holding only a time counts as handled" '[ "$(lines "$G/notify.log")" = "$n" ] && [ ! -f "$ST/old.agents.json" ]'
+
+# a plain `ssh gpu-box` tab opened after a session's tab was closed
+printf 'ttys010  00:10 4999 ssh gpu-box\n' > "$G/ps.txt"; grep -v " ssh web-1$" "$G/ps.full" >> "$G/ps.txt"
+srun gpu-box "#hb" >/dev/null
+check "a session with no tab skips a plain ssh tab opened after its last event" '! grep -q "remote.gpu-box.nowhere" "$G/st/WS-SSH" 2>/dev/null' "$(stat WS-SSH)"
+echo $(( (NOW - 5) * 1000 )) > "$G/t"
+srun gpu-box "$(sev nowhere running E)" >/dev/null
+check "something new in it after the tab opened: the plain ssh tab gets it" 'stat WS-SSH | grep -q "^remote.gpu-box.nowhere=nowhere · "' "$(stat WS-SSH)"
+srun gpu-box "$(sev nowhere end E)" >/dev/null
+cp "$G/ps.full" "$G/ps.txt"
+
+# no tmux: tabs found from the viewers the remote sends
+vev() { local t; t=$(( $(cat "$G/t") + 1 )); echo "$t" > "$G/t"
+  jq -cn --argjson ts "$t" --arg s "$1" --arg k "$2" --arg sid "$3" --argjson v "$4" --arg n "${5:-proj}" \
+    '{v:1, ts:$ts, agent:"claude", kind:$k, session:$s, name:$n, cwd:"/p", text:"", sid:$sid, viewers:$v}'; }
+lsofs() { printf 'p%s\nn10.0.0.2:%s->10.0.0.9:22\n' "$@" > "$G/lsof.txt"; }
+printf 'ttys010  00:10 4999 ssh gpu-box\nttys003  05:00 4998 ssh -t gpu-box\n' > "$G/ps.txt"
+lsofs 4999 50123 4998 50200
+echo $(( (NOW - 4) * 1000 )) > "$G/t"
+srun gpu-box "$(vev pts/4 running V1 '[{"via":"ssh","start":'$((NOW - 10))',"tty":"pts/4","port":50200,"sport":22}]')" >/dev/null
+check "plain ssh, no tmux: the tab whose ssh holds the port, named after the folder" 'stat WS-MAC | grep -q "^remote.gpu-box.pts_4=proj · just now icon=bolt.fill" && ! grep -q pts_4 "$G/st/WS-SSH" 2>/dev/null' "$(stat WS-MAC) / $(stat WS-SSH)"
+srun gpu-box "$(vev pts/4 done V1 '[{"via":"ssh","start":'$((NOW - 10))',"tty":"pts/4","port":50200,"sport":22}]')" >/dev/null
+check "its notification goes to that tab" 'tail -n 1 "$G/notify.log" | grep -q "^--surface UUID-MAC --title Claude finished · proj "' "$(tail -n 1 "$G/notify.log")"
+srun gpu-box "$(vev pts/4 where V1 '[{"via":"ssh","start":'$((NOW - 10))',"tty":"pts/4","port":50123,"sport":22}]')" >/dev/null
+check "where: the line follows to the other tab" 'stat WS-SSH | grep -q "^remote.gpu-box.pts_4=proj · idle" && ! grep -q pts_4 "$G/st/WS-MAC"' "$(stat WS-SSH) / $(stat WS-MAC)"
+# both tabs share one ControlMaster (pid 7000): the login time tells them apart
+lsofs 7000 50300; printf '7000 ssh: /Users/me/.ssh/cm/abc [mux]\n' > "$G/psargs.txt"
+srun gpu-box "$(vev pts/4 where V1 '[{"via":"ssh","start":'$((NOW - 299))',"tty":"pts/4","port":50300,"sport":22}]')" >/dev/null
+check "a shared ControlMaster: the tab that connected when the login started" 'stat WS-MAC | grep -q "^remote.gpu-box.pts_4=" && ! grep -q pts_4 "$G/st/WS-SSH"' "$(stat WS-MAC) / $(stat WS-SSH)"
+# the port belongs to an ssh that is not a tab and not a ControlMaster (a script)
+rm -f "$G/psargs.txt"
+srun gpu-box "$(vev pts/4 where V1 '[{"via":"ssh","start":'$((NOW - 299))',"tty":"pts/4","port":50300,"sport":22}]')" >/dev/null
+check "a port held by an ssh that is no tab: no line" '! grep -q pts_4 "$G/st/WS-MAC" "$G/st/WS-SSH"' "$(stat WS-MAC) / $(stat WS-SSH)"
+# Eternal Terminal: no port, matched by the login time
+printf 'ttys010  00:10 4999 et gpu-box\nttys003  05:00 4998 et gpu-box\n' > "$G/ps.txt"
+srun gpu-box "$(vev pts/2 running V2 '[{"via":"et","start":'$((NOW - 12))',"tty":"pts/2"}]' notes)" >/dev/null
+check "et, no tmux: the tab that connected at the login time" 'stat WS-SSH | grep -q "^remote.gpu-box.pts_2=notes · " && ! grep -q pts_2 "$G/st/WS-MAC"' "$(stat WS-SSH) / $(stat WS-MAC)"
+srun gpu-box "$(vev pts/2 end V2 '[]')" >/dev/null
+# two et tabs opened in the same second: the terminal size tells them apart
+printf 'ttys010  00:10 4999 et gpu-box\nttys003  00:10 4998 et gpu-box\n' > "$G/ps.txt"
+printf 'ttys010 40 120\nttys003 50 200\n' > "$G/sizes.txt"
+srun gpu-box "$(vev pts/2 running V2 '[{"via":"et","start":'$((NOW - 10))',"tty":"pts/2","rows":50,"cols":200}]' notes)" >/dev/null
+check "et tabs opened in the same second: the one with the same terminal size" 'stat WS-MAC | grep -q "^remote.gpu-box.pts_2=notes · " && ! grep -q pts_2 "$G/st/WS-SSH"' "$(stat WS-MAC) / $(stat WS-SSH)"
+printf 'ttys010 50 200\nttys003 50 200\n' > "$G/sizes.txt"
+srun gpu-box "$(vev pts/2 where V2 '[{"via":"et","start":'$((NOW - 10))',"tty":"pts/2","rows":50,"cols":200}]' notes)" >/dev/null
+check "same second and same size: no guessing" '! grep -q pts_2 "$G/st/WS-MAC" "$G/st/WS-SSH"' "$(stat WS-MAC) / $(stat WS-SSH)"
+rm -f "$G/sizes.txt"; srun gpu-box "$(vev pts/2 end V2 '[]')" >/dev/null
+# mosh: matched by the server UDP port
+printf 'ttys010  00:10 4999 mosh-client -# gpu-box | 10.0.0.9 60001\nttys003  00:10 4998 mosh-client -# gpu-box | 10.0.0.9 60002\n' > "$G/ps.txt"
+srun gpu-box "$(vev pts/3 running V4 '[{"via":"mosh","start":'$((NOW - 10))',"tty":"pts/3","sip":"10.0.0.9","mport":60002}]' notes)" >/dev/null
+check "mosh: the tab talking to that UDP port" 'stat WS-MAC | grep -q "^remote.gpu-box.pts_3=notes · " && ! grep -q pts_3 "$G/st/WS-SSH"' "$(stat WS-MAC) / $(stat WS-SSH)"
+srun gpu-box "$(vev pts/3 end V4 '[]')" >/dev/null
+# the tab reached the host by another name (its address): the connection says it is the same host
+printf 'ttys010  00:10 4999 et me@10.0.0.9\nttys003  05:00 4998 et lab\n' > "$G/ps.txt"
+printf 'p4999\nn10.0.0.2:61000->10.0.0.9:2022\np4998\nn10.0.0.2:61001->10.0.0.7:2022\n' > "$G/lsof.txt"
+srun gpu-box "$(vev pts/2 running V5 '[{"via":"et","start":'$((NOW - 10))',"tty":"pts/2","sip":"10.0.0.9"}]' notes)" >/dev/null
+check "a tab opened with the address instead of the host name still counts" 'stat WS-SSH | grep -q "^remote.gpu-box.pts_2=notes · "' "$(stat WS-SSH)"
+srun gpu-box "$(vev pts/2 end V5 '[]')" >/dev/null; srun gpu-box "$(vev pts/4 end V1 '[]')" >/dev/null
+check "end: the lines go" '! grep -q "pts_" "$G/st/WS-SSH" "$G/st/WS-MAC"' "$(stat WS-SSH) / $(stat WS-MAC)"
+# A detached tmux session is seen from nowhere, even with a plain ssh tab open on the host.
+printf 'ttys010  1-00:00:00 4999 ssh gpu-box\n' > "$G/ps.txt"; rm -f "$G/lsof.txt"
+srun gpu-box "$(vev monitor running V3 '[]' monitor)" >/dev/null
+check "a detached tmux session gets no line, not even on the plain ssh tab" '! grep -q monitor "$G/st/WS-SSH" 2>/dev/null' "$(stat WS-SSH)"
+srun gpu-box "$(vev monitor where V3 '[{"via":"ssh","start":'$((NOW - 86400))',"tty":"pts/7"}]' monitor)" >/dev/null
+check "attached by hand in that tab: the line shows there" 'stat WS-SSH | grep -q "^remote.gpu-box.monitor=monitor · "' "$(stat WS-SSH)"
+srun gpu-box "$(vev monitor end V3 '[]' monitor)" >/dev/null
+check "where.json forgets sessions with no Claude" '[ "$(jq -c "keys" "$ST/gpu-box.where.json")" = "[]" ]' "$(cat "$ST/gpu-box.where.json")"
+cp "$G/ps.full" "$G/ps.txt"; rm -f "$G/lsof.txt" "$G/psargs.txt"
 
 # labels: the name shown for a host
 echo '{"gpu-box":"GPU"}' > "$ST/labels.json"

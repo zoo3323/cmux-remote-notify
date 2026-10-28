@@ -1,19 +1,19 @@
 #!/bin/bash
 # cmux-remote-notify: when Claude Code or Codex finishes (or waits for you) on a remote machine
-# you reached over SSH or Eternal Terminal + tmux, notify the cmux tab attached to that session
+# you reached over SSH or Eternal Terminal (with or without tmux), notify the cmux tab it runs in
 # and show the agent's status (Running, Needs input, Idle) in the cmux sidebar.
 #
 # Remote: hook.py appends one line to ~/.local/state/cmux-remote-notify/events.jsonl whenever
-#         an agent starts, finishes or waits.
-# Mac:    `watch` follows that file over SSH, finds the tab whose ssh/et connection goes to the
-#         same host and tmux session, notifies it with `cmux notify` and sets the status line of
-#         its workspace with `cmux set-status`. With no such tab it falls back to a macOS banner.
+#         an agent starts, finishes or waits, with the logins it is seen from (viewers).
+# Mac:    `watch` follows that file over SSH, finds the tab that shows the agent, notifies it with
+#         `cmux notify` and sets the status line of its workspace with `cmux set-status`.
+#         With no such tab it falls back to a macOS banner.
 #
 # Runs on the stock macOS bash 3.2.
 
 set -u
 
-VERSION=0.5.0
+VERSION=0.6.0
 NAME=cmux-remote-notify
 LABEL_PREFIX=io.github.zoo3323.$NAME
 # launchd cannot read files under ~/Desktop or ~/Documents (TCC), so the running copy lives here.
@@ -34,9 +34,9 @@ SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o Ser
 REMOTE_SHARE='$HOME/.local/share/cmux-remote-notify'
 REMOTE_STATE='$HOME/.local/state/cmux-remote-notify'
 US=$'\037'               # field separator; unlike a space it keeps empty fields
-# Only these programs count as a connection from a tab (ssh, autossh, et, and the et that
-# ezet manages). A shell command line that merely mentions a host is never mistaken for one.
-CONNECT_CMD_RE=${CMUX_REMOTE_NOTIFY_CONNECT_RE:-'(^|/)(ssh|autossh|et)$|/ezet/et/[^/]+$'}
+# Only these programs count as a connection from a tab (ssh, autossh, et, the et that ezet
+# manages, and mosh-client). A shell command line that merely mentions a host is never mistaken for one.
+CONNECT_CMD_RE=${CMUX_REMOTE_NOTIFY_CONNECT_RE:-'(^|/)(ssh|autossh|et|mosh-client)$|/ezet/et/[^/]+$'}
 
 export PATH="/Applications/cmux.app/Contents/Resources/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 CMUX=${CMUX_BIN:-cmux}
@@ -61,7 +61,7 @@ die() { printf '%s: %s\n' "$NAME" "$*" >&2; exit 1; }
 usage() {
   if [ "$UI_LANG" = ko ]; then
     cat <<EOF
-$NAME $VERSION: 원격(SSH·ET + tmux)의 Claude Code·Codex 작업이 끝나면 cmux 탭에 알리고
+$NAME $VERSION: 원격(SSH·ET, tmux 는 써도 안 써도 됨)의 Claude Code·Codex 작업이 끝나면 cmux 탭에 알리고
 Claude 상태(Running·Needs input·Idle)를 그 탭의 사이드바에 띄운다
 
 사용법:
@@ -78,7 +78,7 @@ EOF
   else
     cat <<EOF
 $NAME $VERSION: notify the cmux tab when Claude Code or Codex finishes on a remote
-machine (SSH or ET + tmux), and show Running, Needs input or Idle in its sidebar
+machine (SSH or ET, in tmux or not), and show Running, Needs input or Idle in its sidebar
 
 usage:
   $NAME install <host> [--label NAME]   add the remote hooks and start watching from this Mac
@@ -116,12 +116,16 @@ script_root() {
 }
 
 # ---------------------------------------------------------------- finding tabs
-# Print "tty<TAB>host<TAB>session" for every ssh/et connection that runs in a terminal.
+# Print "tty<TAB>host<TAB>session<TAB>started<TAB>pid<TAB>kind<TAB>mip<TAB>mport" for every
+# ssh/et/mosh connection that runs in a terminal. kind is ssh, et or mosh; mip and mport are the
+# server address and UDP port of a mosh connection.
 # host drops user@ and :port. session is the tmux session named on the command line
-# (new-session -s NAME, attach -t NAME), or empty when it cannot be told.
+# (new-session -s NAME, attach -t NAME), or empty when it cannot be told. started is when the
+# connection began (epoch seconds).
 #   ssh -t gpu-box tmux new -A -s train
 #   et gpu-box -c "tmux attach -t train"
 #   ezet: et ... gpu-box -c '/usr/bin/tmux' -L 'ezet-x' new-session -A -s 'train'
+#   mosh-client -# gpu-box tmux a -t train | 10.0.0.9 60001   (what `mosh gpu-box ...` runs)
 #   ssh gpu-box                       (tmux started by hand: session unknown)
 # ps joins the arguments with spaces, so `et -c "tmux a -t x" host` cannot be split back exactly.
 # Known host names (the arguments, plus every installed host) are looked for first; the first
@@ -129,15 +133,32 @@ script_root() {
 connect_tabs() {
   local known
   known=" $(printf '%s ' "$@" $(installed_hosts) | sed 's/[^ ]*@//g') "
-  ps -axo tty=,args= | awk -v re="$CONNECT_CMD_RE" -v known="$known" '
+  ps -axo tty=,etime=,pid=,args= | awk -v re="$CONNECT_CMD_RE" -v known="$known" -v now="${CMUX_REMOTE_NOTIFY_NOW:-$(date +%s)}" '
     function unq(s) { gsub(/^["\047]+|["\047;]+$/, "", s); return s }
     function base(s) { sub(/.*\//, "", s); return s }
+    # ps etime [[dd-]hh:]mm:ss in seconds
+    function secs(t,   d, n, p, i, x) {
+      d = 0; if (index(t, "-")) { d = substr(t, 1, index(t, "-") - 1); t = substr(t, index(t, "-") + 1) }
+      n = split(t, p, ":"); x = 0; for (i = 1; i <= n; i++) x = x * 60 + p[i]
+      return d * 86400 + x
+    }
+    # take out etime and pid so the fields are: tty, program, arguments
+    { started = now - secs($2); pid = $3; $2 = ""; $3 = ""; $0 = $0 }
     $1 == "??" || $1 == "-" || $1 == "" { next }
     $2 !~ re { next }
     {
       prog = base($2)
+      kind = (prog == "et" || $2 ~ /\/ezet\/et\//) ? "et" : (prog == "mosh-client" ? "mosh" : "ssh")
+      mip = ""; mport = ""
+      if (kind == "mosh") {
+        # mosh-client -# <the mosh command line> | <server address> <UDP port>
+        k = 0; for (i = 3; i <= NF; i++) if ($i == "|") k = i
+        if (!k) next
+        mip = $(k + 1); mport = $(k + 2); NF = k - 1
+      }
       # options that take a value, so the value is not taken for the host
-      if (prog == "et" || $2 ~ /\/ezet\/et\//) { sv = "ucptrvkl"; lv = " --username --port --command --terminal-path --tunnel --reversetunnel --jumphost --jport --jserverfifo --verbose --keepalive --logdir --ssh-socket --ssh-config --ssh-option " }
+      if (kind == "mosh") { sv = "p"; lv = " --ssh --port --predict --family --server --client --bind-server --experimental-remote-ip " }
+      else if (kind == "et") { sv = "ucptrvkl"; lv = " --username --port --command --terminal-path --tunnel --reversetunnel --jumphost --jport --jserverfifo --verbose --keepalive --logdir --ssh-socket --ssh-config --ssh-option " }
       else { sv = "BbcDEeFIiJLlmOoPpQRSWw"; lv = " " }
       hi = 0; skip = 0
       for (i = 3; i <= NF; i++) {
@@ -145,7 +166,7 @@ connect_tabs() {
         if (a == "--") { hi = i + 1; break }
         if (a ~ /^--/) { if (a !~ /=/ && index(lv, " " a " ")) i++; continue }
         if (a ~ /^-./) {
-          if (prog != "et" && a ~ /^-[WNO]/) skip = 1   # ssh -W/-N/-O: a jump, tunnel or control call
+          if (kind != "et" && a ~ /^-[WNO]/) skip = 1   # ssh -W/-N/-O: a jump, tunnel or control call
           if (length(a) == 2 && index(sv, substr(a, 2, 1))) i++
           continue
         }
@@ -193,7 +214,7 @@ connect_tabs() {
           if (x == ";" || x == "\\;" || w[j] ~ /;$/) cmd = ""
         }
       }
-      printf "%s\t%s\t%s\n", $1, host, s
+      printf "%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\n", $1, host, s, started, pid, kind, mip, mport
     }'
 }
 
@@ -203,28 +224,103 @@ open_tabs() {
   connect_tabs "$h" | awk -F '\t' -v h="$h" '$2 == h { print $1, $3 }'
 }
 
-# Print "workspaceUUID surfaceUUID" for the cmux tabs attached to this host and session.
-# tree is the JSON of `cmux tree`. Matching order:
-#   1. tabs whose ssh/et command names this session
-#   2. the one tab whose title equals the session name
-#   3. the one tab connected to this host whose session could not be told
+# Connections as JSON {tty, host, session, started, pid, kind, mip, mport, rows, cols}.
+# rows and cols are the tab's terminal size (stty only reads it).
+tabs_json() {
+  local list tty sizes=""
+  list=$(connect_tabs "$@")
+  for tty in $(printf '%s\n' "$list" | cut -f 1 | sort -u); do
+    sizes="$sizes$tty $(stty -f "/dev/$tty" size 2>/dev/null)
+"
+  done
+  printf '%s\n' "$list" | jq -R -s -c --arg sizes "$sizes" '
+    ($sizes | split("\n") | map(split(" ") | select(length == 3) | {key: .[0], value: [(.[1] | tonumber), (.[2] | tonumber)]})
+     | from_entries) as $size
+    | split("\n") | map(select(length > 0) | split("\t")
+    | {tty: .[0], host: .[1], session: (.[2] // ""), started: ((.[3] // "0") | tonumber),
+       pid: ((.[4] // "0") | tonumber), kind: (.[5] // "ssh"), mip: (.[6] // ""),
+       mport: ((.[7] // "") | tonumber? // null)}
+    | . + {rows: ($size[.tty][0] // null), cols: ($size[.tty][1] // null)})'
+}
+
+# This Mac's established TCP connections as JSON {pid, lport, rport, rip, mux}. mux marks an ssh
+# ControlMaster, whose connection carries the sessions of other ssh processes.
+conns_json() {
+  local pids
+  lsof -nP -iTCP -sTCP:ESTABLISHED -F pn 2>/dev/null | awk '
+    /^p/ { pid = substr($0, 2) }
+    /^n/ { n = split(substr($0, 2), e, "->"); if (n != 2) next
+           l = e[1]; sub(/.*:/, "", l); r = e[2]; sub(/.*:/, "", r)
+           ip = e[2]; sub(/:[0-9]+$/, "", ip); gsub(/[][]/, "", ip); print pid, l, r, ip }' > "$STATE_DIR/.conns"
+  pids=$(awk '{ print $1 }' "$STATE_DIR/.conns" | sort -u | tr '\n' ',' | sed 's/,$//')
+  { [ -z "$pids" ] || ps -o pid=,args= -p "$pids" 2>/dev/null | awk '$0 ~ /\[mux\] *$/ { print "mux", $1 }'
+    cat "$STATE_DIR/.conns"; } | jq -R -s -c 'split("\n") | map(select(length > 0) | split(" "))
+    | (map(select(.[0] == "mux") | .[1])) as $mux
+    | map(select(.[0] != "mux") | {pid: (.[0] | tonumber), lport: (.[1] | tonumber),
+        rport: (.[2] | tonumber), rip: (.[3] // ""), mux: (.[0] as $p | $mux | index($p) != null)})' 2>/dev/null || echo '[]'
+}
+
+# jq definitions shared by the sidebar and notifications. They need $host, $tabs and $conns.
+# A session's tabs are
+#   1. tabs whose command line names the tmux session (`tmux new -A -s NAME`) on this host
+#   2. the tabs of its viewers, the logins the remote says it is seen from:
+#      ssh   the tab whose ssh holds the Mac port in SSH_CONNECTION
+#      mosh  the tab whose mosh-client talks to that server UDP port
+#      else  (et, a shared ControlMaster, ProxyJump) the tab that connected when the login
+#            started; logins within 2 seconds of each other are told apart by terminal size
+# A viewer's tab may name the host differently (user@address, another alias): the address the
+# tab is connected to counts as the same host. A tab whose command line names another tmux
+# session is never taken.
+MATCH_JQ='
+  def rips($t): [ $conns[] | select(.pid == $t.pid) | .rip ] + (if ($t.mip // "") != "" then [$t.mip] else [] end);
+  def same_host($t; $v): $t.host == $host or (($v.sip // "") != "" and (rips($t) | index($v.sip)) != null);
+  def near($c; $v):
+    ($c | map(. + {d: ((.started - ($v.start // 0)) | if . < 0 then -. else . end)}) | sort_by(.d)) as $s
+    | if ($s | length) == 0 then []
+      elif $s[0].d > 30 then (if ($s | length) == 1 then $s else [] end)
+      else ([ $s[] | select(.d <= $s[0].d + 2) ]) as $close
+        | if ($close | length) == 1 then $close
+          else [ $close[] | select($v.rows != null and .rows == $v.rows and .cols == $v.cols) ]
+            | if length == 1 then . else [] end end end;
+  def viewer_tabs($s; $v):
+    [ $tabs[] | select(.session == "" or .session == $s) ] as $open
+    | [ $open[] | select(same_host(.; $v)) ] as $mine
+    | (if $v.port then [ $conns[] | select(.lport == $v.port and .rport == ($v.sport // .rport)
+                          and (($v.sip // "") == "" or .rip == $v.sip)) ][0]
+       else null end) as $c
+    | ([ $open[] | select($c != null and .pid == $c.pid) ]) as $own
+    | ([ $open[] | select($v.mport != null and .kind == "mosh" and .mport == $v.mport
+                   and (($v.sip // "") == "" or .mip == $v.sip)) ]) as $mosh
+    | if ($own | length) > 0 then $own
+      elif ($mosh | length) > 0 then $mosh
+      elif $c != null and ($c.mux | not) then []
+      else near([ $mine[] | select(.kind == ($v.via // "")) ]; $v) end;
+  def session_tabs($s; $w):
+    [ $tabs[] | select($s != "" and .host == $host and .session == $s) ]
+    + (if $w != null and $w.viewers != null then [ $w.viewers[] as $v | viewer_tabs($s; $v)[] ] else [] end)
+    | unique_by(.tty);
+  def known($w): $w != null and $w.viewers != null;
+'
+
+# Print "workspaceUUID surfaceUUID" for the cmux tabs that show this session.
+# where is {name, viewers} from the event (null when unknown). Without viewers (an older hook),
+# fall back to the one tab whose title equals the session name, then to the one tab connected to
+# this host whose session could not be told.
 find_targets() {
-  local host=$1 session=$2 tree=$3 tabs ttys ids=""
-  [ -n "$session" ] || return 0
-  tabs=$(open_tabs "$host")
-  ttys=$(printf '%s\n' "$tabs" | awk -v s="$session" '$2 == s { print $1 }' | sort -u)
-  [ -z "$ttys" ] || ids=$(tabs_by_tty "$tree" "$ttys")
-  if [ -z "$ids" ]; then
-    ids=$(printf '%s\n' "$tree" | jq -r --arg s "$session" '
-      [.windows[]?.workspaces[]? | (.id // "-") as $w | .panes[]?.surfaces[]?
-       | select(.type == "terminal" and .title == $s) | "\($w) \(.id)"]
-      | if length == 1 then .[0] else empty end' 2>/dev/null)
-  fi
-  if [ -z "$ids" ]; then
-    ttys=$(printf '%s\n' "$tabs" | awk 'NF == 1 { print $1 }' | sort -u)
-    [ -z "$ttys" ] || ids=$(tabs_by_tty "$tree" "$ttys" | awk 'NR == 1 { first = $0 } END { if (NR == 1) print first }')
-  fi
-  [ -z "$ids" ] || printf '%s\n' "$ids"
+  local host=$1 session=$2 tree=$3 where=${4:-null} tabs conns
+  tabs=$(tabs_json "$host")
+  conns=$(conns_json)
+  printf '%s\n' "$tree" | jq -r --arg host "${host##*@}" --arg s "$session" --argjson w "$where" \
+    --argjson tabs "$tabs" --argjson conns "$conns" "$MATCH_JQ"'
+    [ .windows[]?.workspaces[]? | (.id // "-") as $ws | .panes[]?.surfaces[]?
+      | select(.type == "terminal") | {ws: $ws, id, tty: (.tty // ""), title: (.title // "")} ] as $surf
+    | ([ session_tabs($s; $w)[] as $t | $surf[] | select(.tty == $t.tty) ]) as $hit
+    | if ($hit | length) > 0 or known($w) or $s == "" then $hit
+      else ([ $surf[] | select(.title == $s) ]) as $byname
+        | if ($byname | length) == 1 then $byname
+          else ([ $tabs[] | select(.host == $host and .session == "") ]) as $loose
+            | if ($loose | length) == 1 then [ $surf[] | select(.tty == $loose[0].tty) ] else [] end end end
+    | .[] | "\(.ws) \(.id)"' 2>/dev/null
 }
 
 tabs_by_tty() {
@@ -234,11 +330,12 @@ tabs_by_tty() {
     | select(.type == "terminal") | select((.tty // "") as $x | $t | any(. == $x)) | "\($w) \(.id)"' 2>/dev/null
 }
 
-find_surfaces() { find_targets "$@" | awk '{ print $2 }'; }
 
 # ---------------------------------------------------------------- sidebar status
 # Files per host:
-#   <host>.agents.json  Claude state per session {"<tmux session>": {"<Claude session ID>": {s, ts, since, task}}}
+#   <host>.agents.json  Claude state per session {"<session>": {"<Claude session ID>": {s, ts, since, task}}}
+#                       session is the tmux session, or the remote terminal (pts/N) without tmux
+#   <host>.where.json   where each session is seen from {"<session>": {name, viewers}}
 #   <host>.applied      status lines set in cmux "workspace key text icon color work priority" (US-separated)
 #   descriptions.json   workspace descriptions this tool wrote {workspace: text}, shared by all hosts
 #   labels.json         names shown for hosts {host: label}
@@ -246,21 +343,27 @@ find_surfaces() { find_targets "$@" | awk '{ print $2 }'; }
 # In the sidebar each workspace shows:
 #   my project
 #   gpu-box                               <- description: the hosts this workspace's tabs are on
-#   ⚡ train · 12m · summarize the run      <- one line per tmux session: status, time worked, task
+#   ⚡ train · 12m · summarize the run      <- one line per session: status, time worked, task
+#                                            (named after the folder when there is no tmux)
 #   ⏸ api · idle                          <- a tab with no Claude, or one that is resting
 # When one tmux session holds several Claudes (claude -p inside, for example) the busiest one shows.
 
-# Update a session's state from one event. kind: running|input|idle|done|error|end
+# Update a session's state from one event. kind: running|input|idle|done|error|end|where
+# A Claude is kept under one session only: it moves when it is seen from somewhere else
+# (a background session watched from another tab).
 update_agents() {
   local host=$1 session=$2 sid=$3 kind=$4 ts=$5 text=$6 f new
   f=$STATE_DIR/$host.agents.json
-  case $kind in running|input|idle|done|error|end) ;; *) return 0 ;; esac
+  case $kind in running|input|idle|done|error|end|where) ;; *) return 0 ;; esac
   [ -s "$f" ] || echo '{}' > "$f"
   new=$(jq -c --arg s "$session" --arg id "$sid" --arg k "$kind" --argjson ts "$ts" --arg task "$text" '
-    if $k == "end" then
-      (if .[$s] then .[$s] |= del(.[$id]) else . end) | with_entries(select(.value | length > 0))
+    ([ .[] | .[$id] // empty ][0]) as $was
+    | with_entries(.value |= del(.[$id])) | with_entries(select(.value | length > 0))
+    | if $k == "where" then (if $was then .[$s][$id] = $was else . end)
+    elif $k == "end" then
+      .
     else
-      (.[$s][$id] // {}) as $p
+      ($was // {}) as $p
       | (if $k == "running" or $k == "input" then $k else "idle" end) as $st
       | .[$s][$id] = ({s: $st, ts: $ts}
           # Time worked counts from the prompt, and keeps counting across a permission prompt.
@@ -273,15 +376,27 @@ update_agents() {
   printf '%s\n' "$new" > "$f"
 }
 
+# Remember where a session is seen from ({name, viewers}), and forget sessions with no Claude.
+update_where() {
+  local host=$1 session=$2 name=$3 viewers=$4 f=$STATE_DIR/$host.where.json new
+  [ -s "$f" ] || echo '{}' > "$f"
+  new=$(jq -c --arg s "$session" --arg n "$name" --argjson v "$viewers" \
+      --slurpfile a "$STATE_DIR/$host.agents.json" '
+    (if $s != "" and $v != null then .[$s] = {name: $n, viewers: $v} else . end)
+    | with_entries(select(.key as $k | ($a[0] // {}) | has($k)))' "$f" 2>/dev/null) || return 0
+  printf '%s\n' "$new" > "$f"
+}
+
 # Work out what the sidebar should show. Input: the cmux tree JSON on stdin.
 # Output: "row workspace key text icon color work priority" and "desc set|clear workspace text" (US-separated)
 render_sidebar() {
-  local host=$1 tabs=$2 now=$3 installed=$4
+  local host=$1 tabs=$2 now=$3 installed=$4 conns=$5
   jq -r --arg host "${host##*@}" --arg key_host "$host" --argjson tabs "$tabs" --argjson now "$now" \
-    --arg us "$US" --arg lang "$UI_LANG" --argjson installed "$installed" \
+    --arg us "$US" --arg lang "$UI_LANG" --argjson installed "$installed" --argjson conns "$conns" \
     --slurpfile agents "$STATE_DIR/$host.agents.json" \
+    --slurpfile where "$STATE_DIR/$host.where.json" \
     --slurpfile ours "$STATE_DIR/descriptions.json" \
-    --slurpfile labels "$STATE_DIR/labels.json" '
+    --slurpfile labels "$STATE_DIR/labels.json" "$MATCH_JQ"'
     def ko: $lang == "ko";
     def key($s): ("remote." + $key_host + "." + $s) | gsub("[^A-Za-z0-9._-]"; "_");
     def dur($sec): ($sec / 60 | floor) as $m
@@ -293,19 +408,27 @@ render_sidebar() {
     def uniq: reduce .[] as $x ([]; if any(.[]; . == $x) then . else . + [$x] end);
 
     ($agents[0] // {}) as $agents | ($ours[0] // {}) as $ours | ($labels[0] // {}) as $labels
+    | ($where[0] // {}) as $where
     | [ .windows[]?.workspaces[]? | select(.id != null) | {ws: .id, desc: (.description // "")} ] as $spaces
     | [ .windows[]?.workspaces[]? | (.id // "-") as $w | (.description // "") as $d
         | .panes[]?.surfaces[]? | select(.type == "terminal")
         | {ws: $w, desc: $d, tty: (.tty // ""), title: (.title // "")} ] as $surf
-    | [ $surf[] as $x | $tabs[] | select(.tty == $x.tty) | {ws: $x.ws, host, session} ] as $tabws
+    | [ $surf[] as $x | $tabs[] | select(.tty == $x.tty) | {ws: $x.ws, host, session, started} ] as $tabws
     # the single tab on this host whose session is unknown (plain `ssh host`, tmux started by hand)
-    | ([ $tabws[] | select(.host == $host and .session == "") | .ws ] | if length == 1 then . else [] end) as $loose
+    | ([ $tabws[] | select(.host == $host and .session == "") ] | if length == 1 then . else [] end) as $loose
 
     # one line per session
     | ( (($agents | keys) + [ $tabws[] | select(.host == $host and .session != "") | .session ] | unique)[] as $s
-        | ([ $tabws[] | select(.host == $host and .session == $s) | .ws ] | unique) as $w1
-        | (if ($w1 | length) > 0 then $w1
-           else ([ $surf[] | select(.title == $s) | .ws ] | if length == 1 then . else $loose end) end) as $wss
+        | ($where[$s] // null) as $w
+        | ([ session_tabs($s; $w)[] as $t | $surf[] | select(.tty == $t.tty) | .ws ] | unique) as $w1
+        # No viewer information (an older hook): the one tab with that title, or the plain ssh tab.
+        # A session whose tab was closed would otherwise land on that plain ssh tab, so it goes there
+        # only when something happened in the session after the tab connected.
+        | (([ ($agents[$s] // {})[] | .ts ] | max // 0) / 1000) as $last
+        | (if ($w1 | length) > 0 or known($w) then $w1
+           else ([ $surf[] | select(.title == $s) | .ws ]
+                 | if length == 1 then . else [ $loose[] | select(.started <= $last) | .ws ] end) end) as $wss
+        | (($w.name // "") | if . == "" then $s else . end) as $label
         | ([ ($agents[$s] // {})[] ]) as $sids
         | ((($sids | map(select(.s == "running")) | first) // ($sids | map(select(.s == "input")) | first)
             // ($sids | first))) as $a
@@ -318,7 +441,7 @@ render_sidebar() {
         | (if $st == "running" then ["bolt.fill", "#4C8DFF", "running", "50"]
            elif $st == "input" then ["bell.fill", "#4C8DFF", "", "100"]
            else ["pause.circle.fill", "#8E8E93", "", "30"] end) as $look
-        | $wss[] | select(. != "-") | (["row", ., key($s), "\($s) · \($detail)"] + $look | join($us)) ),
+        | $wss[] | select(. != "-") | (["row", ., key($s), "\($label) · \($detail)"] + $look | join($us)) ),
 
     # Workspace description: the hosts its tabs are on (installed hosts, or connections running tmux).
     # A description the user wrote is never touched.
@@ -337,17 +460,18 @@ render_sidebar() {
 # Bring the session lines and descriptions in the sidebar up to date.
 # check=1 also verifies that what we set is still in cmux (restores it after cmux restarts).
 sync_status() {
-  local host=$1 check=${2:-0} applied tree tabs now out have new="" line installed
+  local host=$1 check=${2:-0} applied tree tabs conns now out have new="" line installed
   local kind ws key label icon color work prio op desc ours rest
   applied=$STATE_DIR/$host.applied
-  for f in "$STATE_DIR/$host.agents.json" "$STATE_DIR/descriptions.json" "$STATE_DIR/labels.json"; do
+  for f in "$STATE_DIR/$host.agents.json" "$STATE_DIR/$host.where.json" "$STATE_DIR/descriptions.json" "$STATE_DIR/labels.json"; do
     [ -s "$f" ] || echo '{}' > "$f"
   done
   tree=$("$CMUX" tree --all --json --id-format both 2>/dev/null) || return 0
   now=${CMUX_REMOTE_NOTIFY_NOW:-$(date +%s)}
-  tabs=$(connect_tabs "$host" | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {tty: .[0], host: .[1], session: (.[2] // "")})')
+  tabs=$(tabs_json "$host")
+  conns=$(conns_json)
   installed=$(installed_hosts | sed 's/.*@//' | jq -R -s -c 'split("\n") | map(select(length > 0))')
-  out=$(printf '%s\n' "$tree" | render_sidebar "$host" "$tabs" "$now" "$installed") || return 0
+  out=$(printf '%s\n' "$tree" | render_sidebar "$host" "$tabs" "$now" "$installed" "$conns") || return 0
   have=$(cat "$applied" 2>/dev/null)
 
   # Set the session lines.
@@ -410,7 +534,7 @@ APPLESCRIPT
 }
 
 notify_event() {
-  local host=$1 ts=$2 agent=$3 kind=$4 session=$5 cwd=$6 text=$7
+  local host=$1 ts=$2 agent=$3 kind=$4 session=$5 cwd=$6 text=$7 name=${8:-} where=${9:-null}
   local who what title body desktop=true tree ids="" id sent=0 why
   why=$(L "no open tab" "열린 탭 없음")
   case $agent in claude) who=Claude ;; codex) who=Codex ;; *) who=$agent ;; esac
@@ -420,13 +544,14 @@ notify_event() {
     error) what=$(L "stopped on an error" "오류로 멈춤") ;;
     *) what=$(L "notice" "알림") ;;
   esac
-  title="$who $what · ${session:-$host}"
+  [ -n "$name" ] || name=$session
+  title="$who $what · ${name:-$host}"
   body=$text
   [ -n "$body" ] || body=${cwd##*/}
   [ -n "$body" ] || body=$host
   [ $(( $(date +%s) - ts / 1000 )) -le "$STALE_SECONDS" ] || desktop=false
   if tree=$("$CMUX" tree --all --json --id-format both 2>"$STATE_DIR/.cmux-error"); then
-    ids=$(find_surfaces "$host" "$session" "$tree")
+    ids=$(find_targets "$host" "$session" "$tree" "$where" | awk '{ print $2 }')
   else
     why=$(L "cannot reach cmux" "cmux 연결 실패")
     log "$(L "could not reach cmux" "cmux 에 연결하지 못했어요"): $(head -n 1 "$STATE_DIR/.cmux-error")"
@@ -465,24 +590,27 @@ first_seen() {
 }
 
 handle_line() {
-  local host=$1 line=$2 fields ts agent kind session cwd text sid
+  local host=$1 line=$2 fields ts agent kind session cwd text sid name viewers where
   case $line in
     '{'*) ;;
     '#'*) sync_status "$host" 1; return 0 ;;   # remote heartbeat (every minute): tidy closed tabs, restore lines
     *) [ -z "$line" ] || log "$host: $line"; return 0 ;;
   esac
-  fields=$(printf '%s' "$line" | jq -r '[(.ts // 0 | tostring), .agent, .kind, .session, .cwd, .text, .sid]
+  fields=$(printf '%s' "$line" | jq -r '[(.ts // 0 | tostring), .agent, .kind, .session, .cwd, .text, .sid, .name,
+      (if (.viewers | type) == "array" then .viewers else null end | tojson)]
     | map((. // "") | tostring | gsub("[\u001f\r\n]"; " ")) | join("\u001f")' 2>/dev/null) || return 0
-  IFS=$US read -r ts agent kind session cwd text sid <<EOF
+  IFS=$US read -r ts agent kind session cwd text sid name viewers <<EOF
 $fields
 EOF
   case $ts in ''|*[!0-9]*) return 0 ;; esac
   first_seen "$host" "$ts" "$line" || return 0
+  case $viewers in '['*) where=$(jq -cn --arg n "$name" --argjson v "$viewers" '{name: $n, viewers: $v}') ;; *) viewers=null where=null ;; esac
   case $kind in
-    done|input|error|note) notify_event "$host" "$ts" "$agent" "$kind" "$session" "$cwd" "$text" ;;
+    done|input|error|note) notify_event "$host" "$ts" "$agent" "$kind" "$session" "$cwd" "$text" "$name" "$where" ;;
   esac
   [ -n "$session" ] && [ -n "$sid" ] || return 0
   update_agents "$host" "$session" "$sid" "$kind" "$ts" "$text"
+  update_where "$host" "$session" "$name" "$viewers"
   sync_status "$host"
 }
 
@@ -812,15 +940,22 @@ EOF
 # The session of one tab connected to this host.
 pick_session() { open_tabs "$1" | awk 'NF == 2 { print $2; exit }'; }
 
+# Viewers that point at one tab connected to this host whose session is unknown.
+pick_viewers() {
+  connect_tabs "$1" | awk -F '\t' -v h="${1##*@}" '$2 == h && $3 == "" {
+    printf "[{\"via\":\"%s\",\"start\":%d}]\n", $6, $4; exit }'
+}
+
 cmd_test() {
-  local host=$1 session=${2:-} payload
+  local host=$1 session=${2:-} payload viewers=""
   check_host "$host"
   [ -n "$session" ] || session=$(pick_session "$host")
+  [ -n "$session" ] || viewers=$(pick_viewers "$host")
   [ -n "$session" ] || session=test
   payload=$(jq -cn --arg msg "$(L "Test notification. If it shows on the '$session' tab, you are connected." "시험 알림이에요. '$session' 탭에 보이면 연결된 거예요.")" \
     '{hook_event_name: "Stop", cwd: "~", last_assistant_message: $msg}')
   printf '%s' "$payload" | ssh $SSH_OPTS "$host" \
-    "CMUX_REMOTE_NOTIFY_SESSION=$(shell_quote "$session") $REMOTE_SHARE/hook.py claude" \
+    "CMUX_REMOTE_NOTIFY_SESSION=$(shell_quote "$session") CMUX_REMOTE_NOTIFY_VIEWERS=$(shell_quote "$viewers") $REMOTE_SHARE/hook.py claude" \
     || die "$(L "could not run the remote hook. Did you run '$NAME install $host'?" "원격 훅을 돌리지 못했어요. 먼저 '$NAME install $host' 를 했는지 확인해 주세요")"
   L "Sent a test event as session '$session' on $host. It should show within seconds.
 " "$host 의 '$session' 세션 이름으로 시험 이벤트를 보냈어요. 몇 초 안에 알림이 떠야 해요.

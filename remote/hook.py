@@ -4,23 +4,34 @@
 Claude Code hooks and Codex (notify) call this whenever an agent starts work, finishes,
 or waits for you. It appends one line to ~/.local/state/cmux-remote-notify/events.jsonl.
 On the Mac, `cmux-remote-notify watch` follows that file over SSH, notifies the cmux tab
-attached to the same tmux session and keeps its sidebar status (Running, Needs input, Idle).
+the agent is seen from and keeps its sidebar status (Running, Needs input, Idle).
 
     hook.py claude              # hook JSON arrives on stdin
     hook.py codex '<json>'      # Codex passes the JSON as the last argument
-    hook.py sweep               # called every minute by the Mac's connection: reaps dead Claude sessions
+    hook.py sweep               # called every minute by the Mac's connection: reaps dead Claude
+                                # sessions and reports the ones whose viewers changed
 
 Event kinds: running, input (waiting for you), idle, done (finished a turn),
-error (stopped on an error), note (any other notification), end (session ended).
+error (stopped on an error), note (any other notification), end (session ended),
+where (the session is now seen from other terminals).
 
-Work outside tmux (scripts, cron) is ignored. The exception is a Claude Code background
-session (/bg, or one started from the agents view): it runs under the daemon outside tmux,
-so its events go to the tab of the tmux client that is watching it.
-CMUX_REMOTE_NOTIFY_SESSION forces a session name for tests.
+Where an agent is seen from, so the Mac can find the tab:
+  in tmux     the session name, and the tmux clients attached to it
+  no tmux     the terminal (pts/N) of the login it runs in
+Each viewer is the login a terminal runs in: an ssh login (with the Mac's port from
+SSH_CONNECTION), an Eternal Terminal login or a mosh login (with its UDP port), with the time it
+started, the server address the Mac connected to and the terminal size.
+Work with no login terminal (scripts, cron, `ssh host cmd`) is ignored. A Claude Code
+background session (/bg, or one started from the agents view) runs under the daemon, so it is
+placed where the client watching it is.
+CMUX_REMOTE_NOTIFY_SESSION forces a session name (`cmux-remote-notify test` and tests), with
+viewers from CMUX_REMOTE_NOTIFY_VIEWERS (JSON). CMUX_REMOTE_NOTIFY_PROC and _DEV replace /proc
+and /dev in tests.
 The hook always exits 0 so it never blocks Claude Code or Codex.
 """
 import json
 import os
+import struct
 import re
 import subprocess
 import sys
@@ -46,40 +57,24 @@ TASK_LIMIT = 80
 
 # Where the Claude Code daemon records clients attaching to background sessions.
 DAEMON_DIR = os.path.expanduser("~/.claude/daemon")
+PROC = os.environ.get("CMUX_REMOTE_NOTIFY_PROC", "/proc")
+DEV = os.environ.get("CMUX_REMOTE_NOTIFY_DEV", "/dev")
+# The parent of a login shell names how the terminal is reached.
+LOGIN_VIA = (("sshd", "ssh"), ("etterminal", "et"), ("mosh-server", "mosh"))
 
 
-def is_bg_session():
-    """Whether the Claude that called this hook is a background session.
-
-    Claude Code strips CLAUDE_CODE_SESSION_KIND from the children of a background session
-    (hooks included), so read the calling Claude process's environment, not our own."""
-    if os.environ.get("CLAUDE_CODE_SESSION_KIND") == "bg":
-        return True
-    pid, _ = claude_process()
-    if pid is None:
-        return False
+def read_environ(pid):
+    """Environment a process started with, or {} when unreadable."""
     try:
-        with open("/proc/%d/environ" % pid, "rb") as f:
-            return b"\0CLAUDE_CODE_SESSION_KIND=bg\0" in b"\0" + f.read() + b"\0"
-    except OSError:
-        return False
+        with open("%s/%d/environ" % (PROC, pid), "rb") as f:
+            return dict(kv.split("=", 1) for kv in
+                        f.read().decode("utf-8", "replace").split("\0") if "=" in kv)
+    except (OSError, ValueError, TypeError):
+        return {}
 
 
-def proc_tmux(pid):
-    """(TMUX, TMUX_PANE) of that process, or None outside tmux or when unreadable."""
-    try:
-        with open("/proc/%d/environ" % pid, "rb") as f:
-            env = dict(kv.split("=", 1) for kv in
-                       f.read().decode("utf-8", "replace").split("\0") if "=" in kv)
-    except (OSError, ValueError):
-        return None
-    if not env.get("TMUX"):
-        return None
-    return env["TMUX"], env.get("TMUX_PANE", "")
-
-
-def bg_client_tmux():
-    """(TMUX, TMUX_PANE) of the Claude client in tmux that is watching the background session.
+def bg_client_pid():
+    """Pid of the Claude client watching this background session, or None.
 
     With several live clients in attach-journal, the most recently attached wins.
     Without any record, fall back to the client that spawned the daemon (--spawned-by)."""
@@ -99,64 +94,192 @@ def bg_client_tmux():
         stat = proc_stat(pid) if pid > 1 else None
         if stat is None or str(rec.get("procStart") or stat[1]) != stat[1]:
             continue
-        got = proc_tmux(pid)
-        if got:
-            found.append((rec.get("startedAtEpochMs") or 0, got))
+        found.append((rec.get("startedAtEpochMs") or 0, pid))
     if found:
-        return max(found, key=lambda x: x[0])[1]
+        return max(found)[1]
     try:
         with open(os.path.join(DAEMON_DIR, "roster.json"), encoding="utf-8") as f:
             sup = int(json.load(f).get("supervisorPid") or 0)
-        with open("/proc/%d/cmdline" % sup, "rb") as f:
+        with open("%s/%d/cmdline" % (PROC, sup), "rb") as f:
             argv = f.read().decode("utf-8", "replace").split("\0")
         pid = int(json.loads(argv[argv.index("--spawned-by") + 1]).get("pid") or 0)
     except (OSError, ValueError, TypeError, AttributeError, IndexError):
         return None
-    return proc_tmux(pid) if pid > 1 else None
+    return pid if pid > 1 and proc_stat(pid) else None
 
 
-def tmux_session():
-    """Name of the tmux session this runs in. None outside tmux, "" when tmux cannot be asked."""
-    forced = os.environ.get("CMUX_REMOTE_NOTIFY_SESSION")
-    if forced:
-        return forced
-    tmux = os.environ.get("TMUX")
-    pane = os.environ.get("TMUX_PANE")
-    if not tmux and is_bg_session():
-        got = bg_client_tmux()
-        if got:
-            tmux, pane = got
-    if not tmux:
-        return None
+def tmux_info(tmux, pane):
+    """(session name, pids of the clients attached to it) for $TMUX/$TMUX_PANE, or None."""
     socket_path, _, rest = tmux.partition(",")
     server_pid = rest.partition(",")[0]
     # Ask with the binary that started the server so the protocol versions match.
     binary = "tmux"
     try:
-        exe = os.readlink("/proc/%s/exe" % server_pid)
+        exe = os.readlink("%s/%s/exe" % (PROC, server_pid))
         if exe.endswith(" (deleted)"):
             exe = exe[: -len(" (deleted)")]
         if os.access(exe, os.X_OK):
             binary = exe
     except OSError:
         pass
-    # display-message only reads. It never starts or changes a server.
-    cmd = [binary, "-S", socket_path, "display-message", "-p"]
-    if pane:
-        cmd += ["-t", pane]
-    cmd.append("#{session_name}")
+    # display-message and list-clients only read. They never start or change a server.
+    target = ["-t", pane] if pane else []
+    cmd = [binary, "-S", socket_path, "display-message", "-p"] + target + ["#{session_name}",
+           ";", "list-clients"] + target + ["-F", "#{client_pid}"]
     try:
         out = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, timeout=2)
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return out.stdout.decode("utf-8", "replace").strip()
+        return None
+    lines = out.stdout.decode("utf-8", "replace").splitlines()
+    if not lines or not lines[0].strip():
+        return None
+    return lines[0].strip(), [int(x) for x in lines[1:] if x.strip().isdigit()]
+
+
+_boot = []
+
+
+def started_at(ticks):
+    """Epoch seconds from a /proc start time in clock ticks."""
+    if not _boot:
+        try:
+            with open(PROC + "/stat") as f:
+                _boot.append(next(int(l.split()[1]) for l in f if l.startswith("btime ")))
+        except (OSError, StopIteration, ValueError, IndexError):
+            _boot.append(0)
+    try:
+        hz = os.sysconf("SC_CLK_TCK")
+    except (ValueError, OSError):
+        hz = 100
+    return _boot[0] + int(ticks) // hz
+
+
+def udp_port(pid):
+    """Local UDP port of a socket the process holds (mosh-server), or None."""
+    inodes = set()
+    try:
+        for fd in os.listdir("%s/%d/fd" % (PROC, pid)):
+            target = os.readlink("%s/%d/fd/%s" % (PROC, pid, fd))
+            if target.startswith("socket:["):
+                inodes.add(target[8:-1])
+    except OSError:
+        return None
+    for name in ("udp", "udp6"):
+        try:
+            with open("%s/%d/net/%s" % (PROC, pid, name)) as f:
+                rows = [l.split() for l in f.readlines()[1:]]
+        except OSError:
+            continue
+        for r in rows:
+            if len(r) > 9 and r[9] in inodes:
+                return int(r[1].rsplit(":", 1)[1], 16)
+    return None
+
+
+def tty_size(tty):
+    """(rows, cols) of a terminal, or None. Only reads; the terminal is not taken over."""
+    try:
+        import fcntl
+        import termios
+        fd = os.open("%s/%s" % (DEV, tty), os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    except (OSError, ImportError):
+        return None
+    try:
+        rows, cols = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))[:2]
+        return (rows, cols) if rows and cols else None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def viewer(pid):
+    """The login terminal process pid runs in, or None:
+    {via, start, tty[, sip][, port, sport][, mport][, rows, cols]}.
+
+    Walks up to the login shell, the child of sshd, etterminal or mosh-server."""
+    cur = pid
+    for _ in range(40):
+        stat = proc_stat(cur)
+        if stat is None or stat[0] <= 1:
+            return None
+        try:
+            with open("%s/%d/comm" % (PROC, stat[0])) as f:
+                comm = f.read().strip()
+        except OSError:
+            return None
+        via = next((v for prefix, v in LOGIN_VIA if comm.startswith(prefix)), None)
+        if via:
+            try:
+                tty = os.readlink("%s/%d/fd/0" % (PROC, cur))
+            except OSError:
+                tty = ""
+            if not tty.startswith("/dev/pts/") and not tty.startswith("/dev/tty"):
+                return None   # `ssh host cmd` without a terminal: no tab shows it
+            v = {"via": via, "start": started_at(stat[1]), "tty": tty[len("/dev/"):]}
+            # The address the Mac connected to (et and mosh logins start over ssh too).
+            conn = read_environ(cur).get("SSH_CONNECTION", "").split()
+            if len(conn) == 4:
+                v["sip"] = conn[2]
+            if via == "ssh" and len(conn) == 4 and conn[1].isdigit() and conn[3].isdigit():
+                v["port"], v["sport"] = int(conn[1]), int(conn[3])
+            if via == "mosh":
+                port = udp_port(stat[0])
+                if port:
+                    v["mport"] = port
+            size = tty_size(v["tty"])
+            if size:
+                v["rows"], v["cols"] = size
+            return v
+        cur = stat[0]
+    return None
+
+
+def place(pid, env):
+    """(key, viewers) for the agent process pid, or None to ignore it.
+
+    key names the sidebar line: the tmux session, or the login terminal (pts/N) without tmux.
+    viewers lists the logins the agent is seen from (None when unknown)."""
+    forced = os.environ.get("CMUX_REMOTE_NOTIFY_SESSION")
+    if forced:
+        try:
+            viewers = json.loads(os.environ.get("CMUX_REMOTE_NOTIFY_VIEWERS") or "null")
+        except ValueError:
+            viewers = None
+        return forced, viewers if isinstance(viewers, list) else None
+    if env.get("CLAUDE_CODE_SESSION_KIND") == "bg":
+        pid = bg_client_pid()
+        if pid is None:
+            return None
+        env = read_environ(pid)
+    if env.get("TMUX"):
+        got = tmux_info(env["TMUX"], env.get("TMUX_PANE", ""))
+        if got is None:
+            return None
+        name, clients = got
+        return name, [v for v in (viewer(c) for c in clients) if v]
+    v = viewer(pid)
+    if v is None:
+        return None
+    return v["tty"], [v]
+
+
+def is_bg_session():
+    """Whether the Claude that called this hook is a background session.
+
+    Claude Code strips CLAUDE_CODE_SESSION_KIND from the children of a background session
+    (hooks included), so read the calling Claude process's environment, not our own."""
+    if os.environ.get("CLAUDE_CODE_SESSION_KIND") == "bg":
+        return True
+    pid, _ = claude_process()
+    return pid is not None and read_environ(pid).get("CLAUDE_CODE_SESSION_KIND") == "bg"
 
 
 def proc_stat(pid):
     """(parent pid, start time), or None if the process is gone."""
     try:
-        with open("/proc/%d/stat" % pid) as f:
+        with open("%s/%d/stat" % (PROC, pid)) as f:
             fields = f.read().rsplit(")", 1)[1].split()
         return int(fields[1]), fields[19]
     except (OSError, IndexError, ValueError):
@@ -171,12 +294,12 @@ def claude_process():
         if stat is None:
             break
         try:
-            with open("/proc/%d/cmdline" % pid, "rb") as f:
+            with open("%s/%d/cmdline" % (PROC, pid), "rb") as f:
                 argv = f.read().decode("utf-8", "replace").split("\0")
         except OSError:
             argv = []
         try:
-            exe = os.readlink("/proc/%d/exe" % pid)
+            exe = os.readlink("%s/%d/exe" % (PROC, pid))
         except OSError:
             exe = ""
         if (argv and os.path.basename(argv[0]) == "claude") or "/claude/" in exe \
@@ -305,7 +428,7 @@ STATE_OF = {"running": "running", "input": "input", "idle": "idle", "done": "idl
 
 
 def track(event):
-    """Record the session's current state and process in live/ (read by sweep and PostToolUse)."""
+    """Record the session's state, place and process in live/ (read by sweep and PostToolUse)."""
     sid = event.get("sid")
     if not sid:
         return
@@ -316,14 +439,17 @@ def track(event):
     if state is None:
         return
     old = read_live(sid) or {}
-    info = {"session": event["session"], "state": state, "pid": old.get("pid"), "start": old.get("start")}
+    info = {"session": event["session"], "name": event.get("name", ""),
+            "viewers": event.get("viewers"), "state": state,
+            "pid": old.get("pid"), "start": old.get("start")}
     if not info["pid"] or proc_stat(info["pid"]) is None:
         info["pid"], info["start"] = claude_process()
     write_live(sid, info)
 
 
 def sweep():
-    """Emit end events for Claude sessions that died without SessionEnd."""
+    """Emit end events for Claude sessions that died without SessionEnd, and where events for
+    the ones now seen from other terminals (a tmux session attached elsewhere, or detached)."""
     try:
         names = os.listdir(LIVE_DIR)
     except OSError:
@@ -346,6 +472,13 @@ def sweep():
             except OSError:
                 continue
         if alive:
+            got = place(int(pid), read_environ(int(pid))) if pid else None
+            if got and got[1] is not None and list(got) != [info.get("session"), info.get("viewers")]:
+                info["session"], info["viewers"] = got
+                write_live(sid, info)
+                append({"v": 1, "ts": int(now * 1000), "agent": "claude", "kind": "where",
+                        "cwd": "", "text": "", "sid": sid, "session": got[0],
+                        "name": info.get("name", ""), "viewers": got[1]})
             continue
         remove_live(sid)
         append({"v": 1, "ts": int(now * 1000), "agent": "claude", "kind": "end",
@@ -363,10 +496,6 @@ def main(argv):
         raw = argv[2] if len(argv) > 2 else ""
     else:
         return
-    # Outside tmux do nothing (an env check, so it is fast). Background sessions are the exception.
-    if not os.environ.get("CMUX_REMOTE_NOTIFY_SESSION") and not os.environ.get("TMUX") \
-            and not is_bg_session():
-        return
     try:
         data = json.loads(raw) if raw.strip() else {}
     except ValueError:
@@ -376,10 +505,21 @@ def main(argv):
     event = build_event(agent, data)
     if event is None:
         return
-    session = tmux_session()
-    if session is None:
+    # Claude Code strips some variables from a background session's hooks, so read the
+    # environment of the Claude process itself.
+    pid = claude_process()[0] if agent == "claude" else None
+    env = read_environ(pid) if pid else {}
+    if not env:
+        pid, env = os.getppid(), dict(os.environ)
+    got = place(pid, env)
+    if got is None:
         return
-    event["session"] = session
+    event["session"] = got[0]
+    if got[1] is not None:
+        event["viewers"] = got[1]
+    # Without tmux the key is a terminal (pts/N), so the line is named after the folder.
+    if got[1] and [v.get("tty") for v in got[1]] == [got[0]]:
+        event["name"] = os.path.basename(event["cwd"].rstrip("/")) or got[0]
     append(event)
     track(event)
 

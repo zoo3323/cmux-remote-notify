@@ -14,7 +14,7 @@
   <img src="docs/img/hero-light.ko.svg" alt="로컬 작업 공간에서 일하는 동안, 사이드바 아래 원격 ml-research 작업 공간에 train 완료와 eval 확인 필요 때마다 읽지 않은 배지와 배너가 뜬다" width="100%">
 </picture>
 
-다른 탭에서 하던 일을 계속하세요. 원격 서버(SSH 나 [Eternal Terminal](https://eternalterminal.dev/) 로 붙은 tmux)의 에이전트가 일을 끝내거나 확인을 기다리면 [cmux](https://cmux.com) 가 알려 줍니다. 맥 배너가 뜨고, 그 작업 공간에 읽지 않은 배지와 탭 테두리가 붙고, 사이드바에 세션마다 지금 하는 일이 보입니다. 이 도구가 없으면 cmux 는 원격 에이전트를 알아채지 못합니다.
+다른 탭에서 하던 일을 계속하세요. 원격 서버(SSH, [Eternal Terminal](https://eternalterminal.dev/), [mosh](https://mosh.org) 로 붙음, tmux 는 써도 안 써도 됨)의 에이전트가 일을 끝내거나 확인을 기다리면 [cmux](https://cmux.com) 가 알려 줍니다. 맥 배너가 뜨고, 그 작업 공간에 읽지 않은 배지와 탭 테두리가 붙고, 사이드바에 세션마다 지금 하는 일이 보입니다. 이 도구가 없으면 cmux 는 원격 에이전트를 알아채지 못합니다.
 
 ## 설치
 
@@ -31,7 +31,7 @@ cmux-remote-notify test gpu-box            # 그 탭에 시험 알림
 |---|---|
 | 맥 | cmux, `jq`(macOS 15 기본 포함, 또는 `brew install jq`), 비밀번호 없이 장비에 붙는 SSH 키 |
 | cmux | 설정 › 자동화 › 소켓 제어 모드: **자동화 모드** |
-| 장비 | Linux, `python3`, **tmux** 안에서 도는 Claude Code. Codex 도 됩니다(알림만) |
+| 장비 | Linux, `python3`, Claude Code(tmux 는 써도 안 써도 됨). Codex 도 됩니다(알림만) |
 
 ## 사이드바
 
@@ -40,7 +40,7 @@ cmux-remote-notify test gpu-box            # 그 탭에 시험 알림
   <img src="docs/img/states-light.ko.svg" alt="사이드바 줄 세 가지: 일한 시간과 질문이 붙은 Running, Needs input, Idle" width="100%">
 </picture>
 
-tmux 세션마다 한 줄이 그 탭이 있는 작업 공간에 붙습니다. 작업 공간 설명 줄에는 장비 이름이 보이고, `install gpu-box --label GPU` 로 하면 `GPU` 로 보입니다.
+tmux 세션마다, tmux 없이 Claude 를 띄운 탭마다(폴더 이름으로) 한 줄이 그 탭이 있는 작업 공간에 붙습니다. 작업 공간 설명 줄에는 장비 이름이 보이고, `install gpu-box --label GPU` 로 하면 `GPU` 로 보입니다.
 
 ## 동작
 
@@ -49,13 +49,20 @@ tmux 세션마다 한 줄이 그 탭이 있는 작업 공간에 붙습니다. �
   <img src="docs/img/flow-light.ko.svg" alt="장비에서는 Claude Code 훅이 hook.py 를 불러 events.jsonl 에 한 줄을 쓰고, 맥의 감시 프로그램이 SSH 로 그 파일을 따라 읽어 cmux notify 와 set-status 를 부른다" width="100%">
 </picture>
 
-훅은 파일에 한 줄을 덧붙이고 끝나서 에이전트를 느리게 하지 않고, 포트도 열지 않습니다. 맥은 장비마다 SSH 연결 하나만 둡니다. 탭은 그 안에서 도는 `ssh`·`et` 명령으로 찾습니다.
+훅은 파일에 한 줄을 덧붙이고 끝나서 에이전트를 느리게 하지 않고, 포트도 열지 않습니다. 맥은 장비마다 SSH 연결 하나만 둡니다.
+
+탭마다 따로 설정할 것은 없습니다. 훅이 에이전트를 어느 접속에서 보고 있는지(tmux 면 그 세션에 붙은 클라이언트들) 알려 주고, 맥은 그 접속을 연 탭을 찾습니다. ssh 접속은 포트로, mosh 접속은 UDP 포트로, et 와 공유 ssh 연결(ControlMaster, ProxyJump)은 접속 시각으로, 2초 안에 연 접속끼리는 터미널 크기로 찾습니다. 탭이 장비를 다른 이름(`사용자@주소`, 다른 별칭)으로 열었어도 실제로 연결된 주소로 같은 장비인지 압니다. 명령줄에 tmux 세션 이름이 있으면 이름으로도 찾습니다. 아래 모두 됩니다.
 
 ```bash
+ssh gpu-box                            # 붙은 뒤 claude, 또는 tmux 를 직접
 ssh -t gpu-box tmux new -A -s train
+et gpu-box                             # 붙은 뒤 claude
 et gpu-box -c "tmux attach -t train"
-ssh gpu-box        # 붙은 뒤 tmux 를 직접 켜도 됨: 그 장비로 열린 탭이 하나일 때
+mosh gpu-box                           # 붙은 뒤 claude
+ssh me@10.0.0.9                        # 같은 장비를 주소로
 ```
+
+떼어 둔(detached) tmux 세션은 다시 붙기 전까지 어느 탭에도 보이지 않습니다.
 
 ## 명령
 
@@ -77,7 +84,7 @@ ssh gpu-box        # 붙은 뒤 tmux 를 직접 켜도 됨: 그 장비로 열린
 |---|---|---|
 | 아무것도 안 옴 | 감시가 멈춤, 훅이 빠짐 | `install <장비>` 다시 |
 | `test` 는 되는데 실제 작업은 안 옴 | 다른 도구가 장비의 `~/.claude/settings.json` 을 다시 씀 | `install <장비>` 다시 |
-| 배너만 오고 탭 표시가 없음 | 그 세션이 열린 탭이 없음 | 위 명령 중 하나로 세션을 엶 |
+| 배너만 오고 탭 표시가 없음 | 그 에이전트를 보여 주는 탭이 없음(떼어 둔 tmux 세션) | 탭에서 그 세션에 다시 붙음 |
 | cmux 업데이트 뒤 멈춤 | 소켓 제어 모드가 'cmux 프로세스만' 으로 돌아감 | 자동화 모드로 |
 | Esc 로 끊었는데 Running 이 남음 | Esc 는 `Stop` 을 보내지 않음 | 1분쯤 뒤 Idle 로 바뀜 |
 
@@ -101,7 +108,9 @@ ssh gpu-box        # 붙은 뒤 tmux 를 직접 켜도 됨: 그 장비로 열린
 
 안내 문구와 사이드바 글자는 macOS 언어를 따릅니다(영어, 한국어). `CMUX_REMOTE_NOTIFY_LANG=en` 이면 영어로 고정합니다.
 
-Claude Code 백그라운드 세션(`/bg`)은 tmux 밖에서 돌기 때문에, 그 세션을 보고 있는 Claude 클라이언트의 탭에 상태를 붙입니다.
+Claude Code 백그라운드 세션(`/bg`)은 데몬 아래에서 돌기 때문에, 그 세션을 보고 있는 Claude 클라이언트의 탭에 상태를 붙입니다.
+
+찾지 못하는 경우: 같은 장비로 2초 안에 연 탭 두 개가 터미널 크기까지 같고, 포트나 tmux 세션 이름으로도 구분되지 않을 때.
 
 맥이 잠들었다 깨면 1분 남짓에 다시 붙고, 그 사이 생긴 이벤트도 받습니다(10분 넘은 것은 배너 없이 탭 표시만). 장비는 1분마다 하트비트를 보내서 끊긴 연결이 오래 남지 않습니다.
 
